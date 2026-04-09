@@ -1,0 +1,84 @@
+# ── Virtual environments ──────────────────────────────────
+.venv*/
+venv*/
+env*/
+hebrewscribe_build/
+
+# ── Python bytecode and packaging ─────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+*.whl
+dist/
+build/
+*.spec.bak
+
+# ── User config (contains local paths, not portable) ──────
+.hebrewscribe_config.json
+.whisper_hebrew_transcriber_config.json
+
+# ── IDE / editor ──────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+.project
+.settings/
+.classpath
+*.code-workspace
+
+# ── Test caches ───────────────────────────────────────────
+.pytest_cache/
+pytest-cache-files-*/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# ── Build / installer outputs ────────────────────────────
+installer/
+
+# ── OS metadata ───────────────────────────────────────────
+Thumbs.db
+Desktop.ini
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+
+# ── Model files (large binaries, not for version control) ─
+*.pt
+*.bin
+*.onnx
+*.safetensors
+
+# ── Personal dev notes and Claude session state ───────────
+.claude/
+CLAUDE.md
+GIT-CHEATSHEET.md
+RELEASING.md
+BACKLOG.md
+
+# ── Local-only scripts ───────────────────────────────────
+scripts/pre-publish-check.sh
+
+# ── Build assets (ffmpeg binaries, archived installers) ──
+/build-assets/
+
+# ── Logs ─────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Secrets (catch-all safety net) ────────────────────────
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx

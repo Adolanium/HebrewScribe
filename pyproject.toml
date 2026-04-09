@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hebrewscribe"
+dynamic = ["version"]
+description = "Desktop GUI for batch Hebrew speech-to-text using local Whisper models"
+authors = [{name = "Yevgeniy Glider", email = "contact@yevgeniyglider.com"}]
+license = {text = "MIT"}
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+faster = ["faster-whisper>=1.0"]
+openai = ["openai-whisper"]
+dnd = ["tkinterdnd2"]
+
+[project.scripts]
+hebrewscribe = "hebrewscribe.app:main"
+
+[project.urls]
+Homepage = "https://yevgeniyglider.com/hebrewscribe"
+Repository = "https://github.com/yevgeniyglider/HebrewScribe"
+
+[tool.setuptools.dynamic]
+version = {attr = "hebrewscribe.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["hebrewscribe*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "slow: runs real model inference (deselect with '-m not slow')",
+]
+addopts = "-m 'not slow'"
