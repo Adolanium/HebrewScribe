@@ -9,6 +9,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -212,11 +213,24 @@ atexit.register(_cleanup_preconvert_dir)
 # ---------------------------------------------------------------------------
 
 def cuda_available() -> bool:
+    """Return True if a CUDA GPU is usable for faster-whisper/CTranslate2.
+
+    Prefer ``ctranslate2.get_cuda_device_count()`` — the packaged app does not
+    bundle PyTorch, so a torch-only check always reported False and forced CPU
+    even when CTranslate2's own CUDA runtime was available.
+    """
+    try:
+        import ctranslate2
+        if int(ctranslate2.get_cuda_device_count()) > 0:
+            return True
+    except Exception:
+        logger.debug("ctranslate2 CUDA probe failed", exc_info=True)
+
     try:
         import torch
         return bool(torch.cuda.is_available())
     except Exception:
-        logger.debug("CUDA availability check failed", exc_info=True)
+        logger.debug("torch CUDA probe failed", exc_info=True)
         return False
 
 
@@ -278,12 +292,10 @@ def _is_ct2_corruption_error(exc: Exception) -> bool:
        ``json.exception.type_error`` family.
 
     2. **Load-time "Unable to open file" errors** — raised by
-       ``ctranslate2.models.Whisper.__init__`` when ``model.bin`` is missing or
-       has a binary format incompatible with the installed ctranslate2 version.
-       This happens after a ctranslate2 major-version upgrade (e.g. building the
-       installer against Python 3.14 bundles a newer ctranslate2 that cannot
-       read a model.bin written by an older version).  Re-downloading forces
-       huggingface_hub to fetch files compatible with the current library.
+       ``ctranslate2.models.Whisper.__init__`` when ``model.bin`` is missing,
+       unreadable, or incompatible.  Not every occurrence means the HF cache
+       is corrupt (Windows symlink / device issues can produce the same
+       message), so callers should validate the on-disk model before purging.
     """
     if not isinstance(exc, RuntimeError):
         return False
@@ -292,6 +304,125 @@ def _is_ct2_corruption_error(exc: Exception) -> bool:
         "json.exception.type_error" in msg
         or "Unable to open file" in msg
     )
+
+
+# Minimum size for a usable CT2 Whisper weight file (tiny is ~75 MB).
+_MIN_MODEL_BIN_BYTES = 10 * 1024 * 1024
+
+# Files required in a CTranslate2 Whisper model directory.
+_CT2_REQUIRED_FILES = (
+    "model.bin",
+    "config.json",
+    "tokenizer.json",
+)
+
+
+def _model_bin_status(model_dir: Path) -> tuple[bool, str]:
+    """Check whether *model_dir* looks like a readable CT2 Whisper model.
+
+    Returns ``(ok, detail)``.  ``ok`` is True only when required files exist,
+    ``model.bin`` is readable, and its size is plausible.
+    """
+    if not model_dir.is_dir():
+        return False, f"not a directory: {model_dir}"
+
+    missing = [name for name in _CT2_REQUIRED_FILES
+               if not (model_dir / name).exists()]
+    if missing:
+        return False, f"missing files: {', '.join(missing)}"
+
+    model_bin = model_dir / "model.bin"
+    try:
+        size = model_bin.stat().st_size
+    except OSError as exc:
+        return False, f"cannot stat model.bin: {exc}"
+
+    if size < _MIN_MODEL_BIN_BYTES:
+        return False, f"model.bin too small ({size} bytes) — download incomplete?"
+
+    try:
+        with open(model_bin, "rb") as fh:
+            header = fh.read(16)
+        if not header:
+            return False, "model.bin is empty / unreadable"
+    except OSError as exc:
+        return False, f"cannot read model.bin: {exc}"
+
+    return True, f"model.bin ok ({size} bytes)"
+
+
+def _materialize_model_dir(model_path: str, host: Optional[WorkerHost] = None) -> str:
+    """Return a model directory free of broken Windows HF-cache symlinks.
+
+    HuggingFace hub stores snapshot files as symlinks into ``blobs/``.  Some
+    native loaders (and some Windows permission setups) fail to open those
+    symlinks even when Python can read them.  When any required file is a
+    symlink, hardlink (or copy) the resolved targets into a sibling
+    ``_materialized`` directory and return that path.
+    """
+    root = Path(model_path)
+    if not root.is_dir():
+        return model_path
+
+    # Already a flat/materialized tree — nothing to do.
+    try:
+        needs_materialize = any(
+            (root / name).is_symlink()
+            for name in ("model.bin", "config.json", "tokenizer.json",
+                         "vocabulary.json", "vocabulary.txt",
+                         "preprocessor_config.json")
+            if (root / name).exists()
+        )
+    except OSError:
+        needs_materialize = False
+
+    if not needs_materialize:
+        return model_path
+
+    dest = root.parent / f"{root.name}__materialized"
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        for src in root.iterdir():
+            if not src.is_file() and not src.is_symlink():
+                continue
+            target = dest / src.name
+            if target.exists():
+                # Reuse existing hardlink/copy if size matches.
+                try:
+                    if target.stat().st_size == src.stat().st_size:
+                        continue
+                except OSError:
+                    pass
+                try:
+                    target.unlink()
+                except OSError:
+                    pass
+
+            real = src.resolve()
+            linked = False
+            try:
+                os.link(str(real), str(target))
+                linked = True
+            except OSError:
+                linked = False
+            if not linked:
+                shutil.copy2(str(real), str(target))
+
+        ok, detail = _model_bin_status(dest)
+        if not ok:
+            logger.warning("Materialized model dir still invalid: %s", detail)
+            return model_path
+
+        if host is not None:
+            host.post_event(
+                "log",
+                message="Using materialized model directory (resolved HF symlinks).",
+            )
+        logger.info("Materialized CT2 model dir: %s -> %s", root, dest)
+        return str(dest)
+    except Exception:
+        logger.warning("Failed to materialize model dir %s", root, exc_info=True)
+        return model_path
 
 
 def _find_hf_cache_dir(model_spec: str) -> Optional[Path]:
@@ -339,13 +470,66 @@ def _find_hf_cache_dir(model_spec: str) -> Optional[Path]:
 
 
 def _purge_and_reload(host: WorkerHost, opts: RunOptions):
-    """Delete a corrupt model cache, re-download, and reload.
+    """Recover from a failed model load: materialize, then purge+re-download.
 
     Returns ``(model, resolved_device)`` — same as :func:`load_model`.
-    Raises if the cache directory cannot be found (model is user-managed)
-    or if re-download / reload fails.
+    Raises if recovery fails.
     """
-    cache_dir = _find_hf_cache_dir(opts.model_spec)
+    # Clear stale batched-pipeline references before any reload.
+    _batched_pipeline_cache.clear()
+
+    # --- Step 1: if the on-disk model looks intact, avoid destructive purge ---
+    # "Unable to open file 'model.bin'" is often a Windows symlink / path issue,
+    # not a corrupt download.  Materialize and retry first.
+    candidate_dirs: list[Path] = []
+    spec = opts.model_spec.strip()
+    if Path(spec).is_dir():
+        candidate_dirs.append(Path(spec))
+    cache_dir = _find_hf_cache_dir(spec)
+    if cache_dir is not None:
+        snapshots = cache_dir / "snapshots"
+        if snapshots.is_dir():
+            candidate_dirs.extend(
+                p for p in snapshots.iterdir() if p.is_dir()
+            )
+
+    for model_dir in candidate_dirs:
+        ok, detail = _model_bin_status(model_dir)
+        if not ok:
+            logger.debug("Skip materialize for %s: %s", model_dir, detail)
+            continue
+        host.post_event(
+            "log",
+            message=("Model files look intact on disk; resolving symlinks and "
+                     f"retrying load ({detail})..."),
+        )
+        host.post_event("job_status", message="Retrying model load...")
+        materialized = _materialize_model_dir(str(model_dir), host=host)
+        try:
+            # Load directly from the local path (bypass hub download).
+            local_opts = RunOptions(
+                backend=opts.backend,
+                model_spec=materialized,
+                output_dir=opts.output_dir,
+                language=opts.language,
+                task=opts.task,
+                device=opts.device,
+                compute_type=opts.compute_type,
+                beam_size=opts.beam_size,
+                vad_filter=opts.vad_filter,
+                condition_on_previous_text=opts.condition_on_previous_text,
+                batch_size=opts.batch_size,
+                formats=list(opts.formats),
+            )
+            model, device = load_model(host, local_opts)
+            host.post_event("log", message=f"Model reloaded on device: {device}")
+            return model, device
+        except Exception as exc:
+            logger.warning(
+                "Materialized reload failed for %s: %s", model_dir, exc,
+            )
+
+    # --- Step 2: destructive purge + re-download (hub models only) ---
     if cache_dir is None:
         raise RuntimeError(
             f"Cannot locate HuggingFace cache for '{opts.model_spec}'. "
@@ -353,15 +537,19 @@ def _purge_and_reload(host: WorkerHost, opts: RunOptions):
         )
 
     host.post_event("log",
-                     message=f"Model cache appears corrupt. "
+                     message=f"Model cache appears corrupt or unreadable. "
                              f"Deleting {cache_dir} and re-downloading...")
     host.post_event("job_status", message="Re-downloading model (cache was corrupt)...")
 
+    # Also drop any materialized sibling dirs left from step 1.
+    snapshots = cache_dir / "snapshots"
+    if snapshots.is_dir():
+        for p in snapshots.iterdir():
+            if p.is_dir() and p.name.endswith("__materialized"):
+                shutil.rmtree(str(p), ignore_errors=True)
+
     shutil.rmtree(str(cache_dir), ignore_errors=True)
     logger.warning("Purged corrupt model cache: %s", cache_dir)
-
-    # Clear stale batched-pipeline references.
-    _batched_pipeline_cache.clear()
 
     model, device = load_model(host, opts)
     host.post_event("log", message=f"Model reloaded on device: {device}")
@@ -401,6 +589,12 @@ def load_model(host: WorkerHost, opts: RunOptions):
         # CTranslate2 (faster-whisper backend) does not support MPS;
         # on macOS Apple Silicon it runs on CPU with int8 acceleration.
         device = "cuda" if cuda_available() else "cpu"
+    elif device == "cuda" and not cuda_available():
+        host.post_event(
+            "log",
+            message="CUDA requested but no GPU is available to CTranslate2; using CPU.",
+        )
+        device = "cpu"
 
     compute_type = opts.compute_type
     if compute_type == "auto":
@@ -422,6 +616,15 @@ def load_model(host: WorkerHost, opts: RunOptions):
     if _is_hub_id:
         model_path = _download_with_progress(host, _spec)
 
+    # Resolve HF snapshot symlinks on Windows before handing the path to CT2.
+    if Path(model_path).is_dir():
+        ok, detail = _model_bin_status(Path(model_path))
+        if not ok:
+            raise RuntimeError(
+                f"Model directory is not ready for loading ({detail}): {model_path}"
+            )
+        model_path = _materialize_model_dir(model_path, host=host)
+
     # Shorten model spec for log display (full path shown only in debug log)
     _display_spec = opts.model_spec
     if len(_display_spec) > 60 or os.sep in _display_spec:
@@ -433,7 +636,34 @@ def load_model(host: WorkerHost, opts: RunOptions):
         else:
             _display_spec = _p.name
     host.post_event("log", message=f"Loading faster-whisper model: {_display_spec}")
-    model = faster_whisper.WhisperModel(model_path, device=device, compute_type=compute_type)
+
+    def _try_load(dev: str, ctype: str):
+        return faster_whisper.WhisperModel(
+            model_path, device=dev, compute_type=ctype,
+        )
+
+    try:
+        model = _try_load(device, compute_type)
+    except Exception as first_exc:
+        # If CUDA load fails for any reason, fall back to CPU before giving up.
+        # A common misreport is "Unable to open file 'model.bin'" when the real
+        # problem is a broken/partial CUDA runtime in the frozen app.
+        if device == "cuda":
+            host.post_event(
+                "log",
+                message=(
+                    f"CUDA load failed ({first_exc}). Falling back to CPU/int8..."
+                ),
+            )
+            try:
+                model = _try_load("cpu", "int8")
+                device = "cpu"
+                compute_type = "int8"
+            except Exception:
+                raise first_exc from None
+        else:
+            raise
+
     batch_label = "auto" if opts.batch_size == 0 else str(opts.batch_size)
     host.post_event("log", message=f"Device: {device}, compute: {compute_type}, batch_size: {batch_label}")
     return model, device
@@ -444,18 +674,42 @@ def _download_with_progress(host: WorkerHost, repo_id: str) -> str:
 
     Returns the local path to use with WhisperModel().
     If the model is already cached, returns immediately with no download events.
+
+    After download (or cache hit), validates that ``model.bin`` is present,
+    readable, and large enough — hub metadata can report "complete" while the
+    weight file is still missing or a broken symlink.
     """
     import huggingface_hub
+
+    # On Windows, prefer real files over hub snapshot symlinks when possible.
+    # (Safe no-op on other platforms / older hub versions.)
+    if sys.platform == "win32":
+        os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS", "1")
+
+    _allow = [
+        "config.json", "preprocessor_config.json",
+        "model.bin", "tokenizer.json", "vocabulary.*",
+    ]
+
+    def _validate_or_raise(local_path: str, context: str) -> str:
+        ok, detail = _model_bin_status(Path(local_path))
+        if not ok:
+            raise RuntimeError(
+                f"Model download {context} but files are not usable ({detail}). "
+                f"Path: {local_path}"
+            )
+        return local_path
 
     # Check if already cached (fast path — no download events emitted)
     try:
         local = huggingface_hub.snapshot_download(
             repo_id, local_files_only=True,
-            allow_patterns=["config.json", "preprocessor_config.json",
-                            "model.bin", "tokenizer.json", "vocabulary.*"],
+            allow_patterns=_allow,
         )
         host.post_event("log", message=f"Model already cached: {repo_id}")
-        return local
+        return _validate_or_raise(local, "reported as cached")
+    except RuntimeError:
+        raise
     except Exception:
         pass  # Not cached — proceed with download
 
@@ -544,10 +798,10 @@ def _download_with_progress(host: WorkerHost, repo_id: str) -> str:
 
     local = huggingface_hub.snapshot_download(
         repo_id,
-        allow_patterns=["config.json", "preprocessor_config.json",
-                        "model.bin", "tokenizer.json", "vocabulary.*"],
+        allow_patterns=_allow,
         tqdm_class=_ProgressTqdm,
     )
+    local = _validate_or_raise(local, "finished")
     host.post_event("download_done", repo_id=repo_id)
     host.post_event("log", message=f"Download complete: {repo_id}")
     return local

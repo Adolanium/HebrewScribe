@@ -16,6 +16,7 @@ from hebrewscribe.worker import (
     _completion_progress, _auto_batch_size, _get_batched_pipeline,
     _batched_pipeline_cache, preconvert_audio,
     _is_ct2_corruption_error, _find_hf_cache_dir,
+    _model_bin_status, _materialize_model_dir, cuda_available,
 )
 
 
@@ -679,6 +680,116 @@ class TestIsCt2CorruptionError(unittest.TestCase):
             "models--ivrit-ai--whisper-large-v3-ct2\\snapshots\\abc123'"
         )
         self.assertTrue(_is_ct2_corruption_error(exc))
+
+
+class TestModelBinStatus(unittest.TestCase):
+    """Tests for _model_bin_status validation helper."""
+
+    def test_ok_for_complete_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            (d / "model.bin").write_bytes(b"x" * (11 * 1024 * 1024))
+            (d / "config.json").write_text("{}", encoding="utf-8")
+            (d / "tokenizer.json").write_text("{}", encoding="utf-8")
+            ok, detail = _model_bin_status(d)
+            self.assertTrue(ok, detail)
+            self.assertIn("ok", detail)
+
+    def test_fails_when_model_bin_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            (d / "config.json").write_text("{}", encoding="utf-8")
+            (d / "tokenizer.json").write_text("{}", encoding="utf-8")
+            ok, detail = _model_bin_status(d)
+            self.assertFalse(ok)
+            self.assertIn("missing", detail)
+
+    def test_fails_when_model_bin_too_small(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            (d / "model.bin").write_bytes(b"tiny")
+            (d / "config.json").write_text("{}", encoding="utf-8")
+            (d / "tokenizer.json").write_text("{}", encoding="utf-8")
+            ok, detail = _model_bin_status(d)
+            self.assertFalse(ok)
+            self.assertIn("too small", detail)
+
+
+class TestMaterializeModelDir(unittest.TestCase):
+    """Tests for _materialize_model_dir (symlink resolution)."""
+
+    def test_passthrough_when_no_symlinks(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir) / "model"
+            d.mkdir()
+            (d / "model.bin").write_bytes(b"x" * (11 * 1024 * 1024))
+            (d / "config.json").write_text("{}", encoding="utf-8")
+            result = _materialize_model_dir(str(d))
+            self.assertEqual(result, str(d))
+
+    def test_materializes_symlinked_model_bin(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            blobs = root / "blobs"
+            snap = root / "snapshots" / "abc"
+            blobs.mkdir(parents=True)
+            snap.mkdir(parents=True)
+
+            real_bin = blobs / "weights"
+            real_bin.write_bytes(b"x" * (11 * 1024 * 1024))
+            real_cfg = blobs / "cfg"
+            real_cfg.write_text("{}", encoding="utf-8")
+            real_tok = blobs / "tok"
+            real_tok.write_text("{}", encoding="utf-8")
+
+            try:
+                (snap / "model.bin").symlink_to(real_bin)
+                (snap / "config.json").symlink_to(real_cfg)
+                (snap / "tokenizer.json").symlink_to(real_tok)
+            except OSError:
+                self.skipTest("symlinks not available on this system")
+
+            result = Path(_materialize_model_dir(str(snap)))
+            self.assertNotEqual(result, snap)
+            self.assertTrue((result / "model.bin").exists())
+            self.assertFalse((result / "model.bin").is_symlink())
+            self.assertGreaterEqual(
+                (result / "model.bin").stat().st_size, 11 * 1024 * 1024,
+            )
+
+
+class TestCudaAvailable(unittest.TestCase):
+    """cuda_available should prefer ctranslate2 over torch."""
+
+    def test_uses_ctranslate2_device_count(self):
+        fake_ct2 = types.ModuleType("ctranslate2")
+        fake_ct2.get_cuda_device_count = lambda: 1  # type: ignore[attr-defined]
+        with patch.dict("sys.modules", {"ctranslate2": fake_ct2}):
+            self.assertTrue(cuda_available())
+
+    def test_false_when_ctranslate2_and_torch_report_no_gpu(self):
+        fake_ct2 = types.ModuleType("ctranslate2")
+        fake_ct2.get_cuda_device_count = lambda: 0  # type: ignore[attr-defined]
+        fake_torch = types.ModuleType("torch")
+        fake_cuda = types.SimpleNamespace(is_available=lambda: False)
+        fake_torch.cuda = fake_cuda  # type: ignore[attr-defined]
+        with patch.dict("sys.modules", {
+            "ctranslate2": fake_ct2,
+            "torch": fake_torch,
+        }):
+            self.assertFalse(cuda_available())
+
+    def test_ctranslate2_zero_falls_back_to_torch(self):
+        fake_ct2 = types.ModuleType("ctranslate2")
+        fake_ct2.get_cuda_device_count = lambda: 0  # type: ignore[attr-defined]
+        fake_torch = types.ModuleType("torch")
+        fake_cuda = types.SimpleNamespace(is_available=lambda: True)
+        fake_torch.cuda = fake_cuda  # type: ignore[attr-defined]
+        with patch.dict("sys.modules", {
+            "ctranslate2": fake_ct2,
+            "torch": fake_torch,
+        }):
+            self.assertTrue(cuda_available())
 
 
 class TestFindHfCacheDir(unittest.TestCase):
