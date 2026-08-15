@@ -30,8 +30,11 @@ SPEECH_WAV = FIXTURE_DIR / "speech_6s.wav"
 MODEL_REPO = "Systran/faster-whisper-tiny"
 
 # Known transcript (lowercased, for substring matching).
+# The fixture is synthesized speech (macOS `say`, voice Samantha):
+# "This is a short recording used to test the transcription pipeline,
+#  with a few seconds of spoken English."
 # Exact wording may vary slightly across model versions.
-EXPECTED_FRAGMENTS = ["beatles", "love"]
+EXPECTED_FRAGMENTS = ["recording", "pipeline"]
 
 
 def _requires_faster_whisper():
