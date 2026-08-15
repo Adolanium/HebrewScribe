@@ -8,6 +8,7 @@ All failures are logged and swallowed — sleep prevention is best-effort.
 """
 
 import logging
+import os
 import subprocess
 import sys
 
@@ -92,9 +93,11 @@ class SleepInhibitor:
     # --- macOS ---------------------------------------------------------
 
     def _acquire_macos(self) -> None:
-        # caffeinate -i: prevent idle sleep; dies when parent kills it
+        # caffeinate -i: prevent idle sleep. -w ties it to our pid so it
+        # self-exits even if the app dies without calling release() (Cmd+Q,
+        # crash) — otherwise an orphaned caffeinate blocks sleep forever.
         self._process = subprocess.Popen(
-            ["caffeinate", "-i"],
+            ["caffeinate", "-i", "-w", str(os.getpid())],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )

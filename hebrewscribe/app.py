@@ -2,10 +2,11 @@ import logging
 import os
 import queue
 import re
+import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -14,7 +15,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from hebrewscribe.utils import (
     AUDIO_EXTENSIONS, LANGUAGE_OPTIONS, LANGUAGE_DISPLAY, OUTPUT_FORMATS,
-    SYSTEM_FONT,
+    SYSTEM_FONT, bidi_name,
     load_json, save_json, is_package_available,
     ffmpeg_available, probe_duration_seconds, _open_path,
     format_hms, get_log_dir, setup_logging,
@@ -27,13 +28,40 @@ from hebrewscribe.models import (
     get_primary_model_cache_dir,
 )
 from hebrewscribe.worker import (
-    CancelledByUser, RunOptions, SelfTestResult,
+    CancelledByUser, RunOptions, SelfTestResult, SELFTEST_CHECK_COUNT,
     run_selftest, run_transcription_worker,
 )
 from hebrewscribe.power import SleepInhibitor
 from hebrewscribe.theme import install_modern_theme, Colors as C, _fs, PAD_CARD_INNER_X, PAD_CARD_INNER_Y, PAD_TOOLBAR_GAP, PAD_SECTION_BELOW
 from hebrewscribe.icons import load_icon
 from hebrewscribe.widgets import ToolTip, TaskbarProgress
+
+_HAS_SOUNDDEVICE = False
+try:
+    import sounddevice as _sd  # noqa: F401 — availability check only
+    _HAS_SOUNDDEVICE = True
+except (ImportError, OSError):
+    # OSError: sounddevice imports but raises when the PortAudio binary
+    # fails to load (e.g. a broken frozen bundle) — degrade to no recording
+    # instead of killing the whole windowed app at startup.
+    pass
+
+# Disable pyannote's default-on telemetry before anything can import it
+# (pyannote 4.x posts to otel.pyannote.ai unless this is set). setdefault:
+# an explicit user opt-in via the env var is respected.
+os.environ.setdefault("PYANNOTE_METRICS_ENABLED", "false")
+
+# Cheap metadata probe, deliberately NOT a real import: pyannote.audio pulls
+# torch, which would add seconds to every launch of the bundled app. A
+# present-but-broken install surfaces at batch start via the worker's
+# degrade-to-no-labels path.
+import importlib.util as _importlib_util
+try:
+    # find_spec("pyannote.audio") imports the parent package, which raises
+    # ModuleNotFoundError when pyannote is absent entirely.
+    _HAS_PYANNOTE = _importlib_util.find_spec("pyannote.audio") is not None
+except (ImportError, ValueError):
+    _HAS_PYANNOTE = False
 
 APP_TITLE = "HebrewScribe"
 
@@ -137,8 +165,11 @@ class TranscriberApp(tk.Tk):
         # displays 1.0.  Used to scale hardcoded pixel values (geometry,
         # column widths) so the app looks correct at any system scaling.
         self._dpi_scale: float = self.winfo_fpixels("1i") / 96.0
-        # Clamp to reasonable range to avoid pathological values
-        if self._dpi_scale < 0.75:
+        # Clamp to reasonable range to avoid pathological values.
+        # Never shrink below the 96-DPI design baseline: Aqua Tk reports
+        # ~72 px/inch (points), which would otherwise scale the whole UI
+        # down ~25% on every macOS launch.
+        if self._dpi_scale < 1.0:
             self._dpi_scale = 1.0
         elif self._dpi_scale > 4.0:
             self._dpi_scale = 4.0
@@ -148,8 +179,15 @@ class TranscriberApp(tk.Tk):
             return round(px * self._dpi_scale)
 
         self._s = _s
-        self.geometry(f"{_s(1260)}x{_s(860)}")
-        self.minsize(_s(1100), _s(640))
+        # Clamp to the usable screen: on 1366x768 laptops (or 150% scaling on
+        # 1920x1080) the scaled 1260x860 design size would exceed the display,
+        # and a minsize larger than the screen makes the window unfittable.
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        win_w = min(_s(1260), screen_w - _s(40))
+        win_h = min(_s(860), screen_h - _s(80))
+        self.geometry(f"{win_w}x{win_h}")
+        self.minsize(min(_s(1100), win_w), min(_s(640), win_h))
 
         # Apply modern flat theme before building any widgets
         try:
@@ -174,6 +212,10 @@ class TranscriberApp(tk.Tk):
             "last_batch_size": 0,
             "last_speed_preset": "quality",
             "last_formats": ["txt", "srt"],
+            "experimental_recording": False,
+            "last_diarize": False,
+            "last_num_speakers": 0,
+            "diarize_device": "auto",
         })
 
         self.worker_thread: Optional[threading.Thread] = None
@@ -183,8 +225,18 @@ class TranscriberApp(tk.Tk):
         self.stop_requested = False
         self.cancel_requested = False
 
+        # Live recording state
+        self._recorder = None  # LiveRecorder instance (created on first use)
+
         self.file_paths: List[str] = []
         self._queue_lock = threading.Lock()  # guards file_paths access between GUI and worker
+        # Plain-Python mirror of each row's display status (path -> status),
+        # maintained on the GUI thread by set_tree_row/refresh_file_tree.
+        # The worker's next_file() reads THIS under _queue_lock instead of
+        # the Treeview: a Tcl call from the worker could hit a mid-rebuild
+        # tree (TclError kills the batch) or deadlock against a GUI thread
+        # waiting on the same lock.
+        self.file_status: Dict[str, str] = {}
         self.model_map: Dict[str, str] = {}
         self.file_items: Dict[str, str] = {}
         self.file_errors: Dict[str, str] = {}  # path -> error message for failed files
@@ -209,8 +261,21 @@ class TranscriberApp(tk.Tk):
         self.batch_size_var = tk.StringVar(
             value=str(self.config_data.get("last_batch_size", 0)))
         self.speed_preset_var = tk.StringVar(
-            value=self.config_data.get("last_speed_preset", "fast"))
+            value=self.config_data.get("last_speed_preset", "quality"))
         self.show_all_models_var = tk.BooleanVar(value=False)
+
+        # Speaker diarization controls. The checkbox state is forced off when
+        # the engine is absent so readiness can never block Start over an
+        # invisible control. num_speakers is a StringVar (like beam/batch) so
+        # mid-edit garbage can't raise inside Tk callbacks.
+        self.diarize_var = tk.BooleanVar(value=self._diarize_enabled_initial(
+            self.config_data.get("last_diarize", False), _HAS_PYANNOTE))
+        self.num_speakers_var = tk.StringVar(
+            value=str(self.config_data.get("last_num_speakers", 0)))
+        _saved_ddev = self.config_data.get("diarize_device", "auto")
+        if _saved_ddev not in ("auto", "cpu"):
+            _saved_ddev = "auto"
+        self.diarize_device_var = tk.StringVar(value=_saved_ddev)
 
         self.job_status_var = tk.StringVar(value="Ready.")
         self.current_file_var = tk.StringVar(value="No file running")
@@ -232,8 +297,10 @@ class TranscriberApp(tk.Tk):
         self._last_job_wall: float = 0.0
         self._last_finished_file_path: Optional[str] = None
 
-        self.format_vars = {fmt: tk.BooleanVar(value=fmt in self.config_data.get("last_formats", ["txt"])) for fmt in OUTPUT_FORMATS}
+        self.format_vars = {fmt: tk.BooleanVar(value=fmt in self.config_data.get("last_formats", ["txt", "srt"])) for fmt in OUTPUT_FORMATS}
         self.prevent_sleep_var = tk.BooleanVar(value=self.config_data.get("prevent_sleep", True))
+        self._experimental_recording_var = tk.BooleanVar(
+            value=self.config_data.get("experimental_recording", False))
         self._sleep_inhibitor = SleepInhibitor()
         self.readiness_var = tk.StringVar(value="")
         self.advanced_visible = tk.BooleanVar(value=self.config_data.get("advanced_visible", False))
@@ -267,7 +334,7 @@ class TranscriberApp(tk.Tk):
         self._log_run_id: int = 0           # incremented each start_transcription
         self._log_current_phase: str = "user"  # tracks phase context for ambiguous messages
         self._log_current_file: Optional[str] = None  # file_path of file being transcribed
-        # Activity tree node tracking (set in Phase 2/3)
+        # Activity tree node tracking (populated by the _activity_* handlers)
         self._activity_setup_node: str = ""
         self._activity_files_node: str = ""
         self._activity_file_nodes: Dict[str, str] = {}
@@ -280,7 +347,12 @@ class TranscriberApp(tk.Tk):
         self._build_ui()
         self._apply_speed_preset()  # set initial preset description
         self._populate_backends()
-        self.refresh_models()
+        # Build the model list AND restore the saved per-language model. Calling
+        # _on_language_changed (rather than bare refresh_models) applies the
+        # saved-pref > recommended > affinity ladder at startup, so a returning
+        # user's last model choice is honoured instead of silently reset to the
+        # first-sorted entry.
+        self._on_language_changed()
         self._wire_readiness_checks()
         self._check_readiness()
         self.after(120, self.process_event_queue)
@@ -292,14 +364,22 @@ class TranscriberApp(tk.Tk):
         # Detect GPU/device at startup (deferred to avoid slowing init)
         self.after(600, self._detect_device_info)
 
-        # #16: Keyboard shortcuts
+        # Keyboard shortcuts
         self.bind_all("<Control-Return>", self._on_ctrl_enter)
         self.bind_all("<Escape>", self._on_escape)
 
         # Exit confirmation when job is running
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        if sys.platform == "darwin":
+            # Cmd+Q / app-menu Quit terminates Tk directly without firing
+            # WM_DELETE_WINDOW — route it through the same close path so the
+            # running-job confirm, config save, and caffeinate release happen.
+            try:
+                self.createcommand("::tk::mac::Quit", self._on_close)
+            except Exception:
+                logger.debug("Could not register mac Quit handler", exc_info=True)
 
-        # #7: Auto-refresh model list when window regains focus (debounced)
+        # Auto-refresh model list when window regains focus (debounced)
         self._last_focus_refresh: float = 0.0
         self.bind("<FocusIn>", self._on_focus_in)
 
@@ -405,111 +485,14 @@ class TranscriberApp(tk.Tk):
             close_btn = self._make_button(btn_frame, text="Close", command=dlg.destroy)
             close_btn.pack(side="right")
 
-            dlg.bind("<Escape>", lambda e: dlg.destroy())
-
-            def _on_dismiss():
+            def _on_dismiss(_event=None):
                 self._crash_dialog_shown = False
                 dlg.destroy()
 
-            dlg.protocol("WM_DELETE_WINDOW", _on_dismiss)
-            close_btn.config(command=_on_dismiss)
-
-            # Center on parent
-            dlg.update_idletasks()
-            x = self.winfo_x() + (self.winfo_width() - dlg.winfo_width()) // 2
-            y = self.winfo_y() + (self.winfo_height() - dlg.winfo_height()) // 2
-            dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
-        except Exception:
-            # If the crash dialog itself crashes, reset the flag and log
-            self._crash_dialog_shown = False
-            logger.critical("Failed to show crash dialog", exc_info=True)
-
-    # --- Global exception handling ---
-    _crash_dialog_shown = False
-
-    def report_callback_exception(self, exc_type, exc_value, exc_tb):
-        """Override Tk's default handler to log + show a crash dialog."""
-        import traceback as _tb
-        logger.critical(
-            "Unhandled exception in UI callback:\n%s",
-            "".join(_tb.format_exception(exc_type, exc_value, exc_tb)),
-        )
-        self._show_crash_dialog(exc_type, exc_value, exc_tb)
-
-    def _show_crash_dialog(self, exc_type, exc_value, exc_tb) -> None:
-        """Show a modal dialog with the traceback and action buttons."""
-        import traceback as _tb
-        if self._crash_dialog_shown:
-            return  # prevent recursive crash dialogs
-        self._crash_dialog_shown = True
-        try:
-            tb_text = "".join(_tb.format_exception(exc_type, exc_value, exc_tb))
-            dlg = tk.Toplevel(self)
-            dlg.title(f"{APP_TITLE} \u2014 Unexpected Error")
-            dlg.resizable(True, True)
-            dlg.transient(self)
-            dlg.grab_set()
-            if self._icon_path:
-                dlg.iconbitmap(self._icon_path)
-
-            _s = self._s
-            frame = ttk.Frame(dlg, padding=_s(20))
-            frame.pack(fill="both", expand=True)
-
-            ttk.Label(
-                frame, text="Something went wrong.",
-                font=(SYSTEM_FONT, 13, "bold"),
-            ).pack(anchor="w")
-            ttk.Label(
-                frame,
-                text="The error has been logged. You can copy the details below.",
-                font=self.FONT_SMALL, foreground="#636363",
-            ).pack(anchor="w", pady=(_s(4), _s(12)))
-
-            # Scrollable traceback
-            text_frame = ttk.Frame(frame)
-            text_frame.pack(fill="both", expand=True)
-            scrollbar = ttk.Scrollbar(text_frame, orient="vertical")
-            scrollbar.pack(side="right", fill="y")
-            text_widget = tk.Text(
-                text_frame, wrap="word", font=("Consolas" if sys.platform == "win32" else "Menlo", 9),
-                bg="#1a1a1a", fg="#f0f0f0", insertbackground="#f0f0f0",
-                relief="flat", borderwidth=0,
-                yscrollcommand=scrollbar.set,
-                height=16, width=80,
-            )
-            text_widget.pack(fill="both", expand=True)
-            scrollbar.config(command=text_widget.yview)
-            text_widget.insert("1.0", tb_text)
-            text_widget.config(state="disabled")
-
-            # Action buttons
-            btn_frame = ttk.Frame(frame)
-            btn_frame.pack(fill="x", pady=(_s(12), 0))
-
-            def _copy():
-                self.clipboard_clear()
-                self.clipboard_append(tb_text)
-
-            def _open_logs():
-                try:
-                    _open_path(get_log_dir())
-                except Exception:
-                    pass
-
-            copy_btn = self._make_button(btn_frame, text="Copy to clipboard", command=_copy)
-            copy_btn.pack(side="left", padx=(0, _s(8)))
-            log_btn = self._make_button(btn_frame, text="Open log folder", command=_open_logs)
-            log_btn.pack(side="left")
-            close_btn = self._make_button(btn_frame, text="Close", command=dlg.destroy)
-            close_btn.pack(side="right")
-
-            dlg.bind("<Escape>", lambda e: dlg.destroy())
-
-            def _on_dismiss():
-                self._crash_dialog_shown = False
-                dlg.destroy()
-
+            # Route every dismissal path (Escape, window close, Close button)
+            # through _on_dismiss so the guard flag is always reset — otherwise
+            # dismissing with Escape suppresses all later crash dialogs.
+            dlg.bind("<Escape>", _on_dismiss)
             dlg.protocol("WM_DELETE_WINDOW", _on_dismiss)
             close_btn.config(command=_on_dismiss)
 
@@ -620,8 +603,11 @@ class TranscriberApp(tk.Tk):
         self._statusbar_left = ttk.Label(self._status_bar, textvariable=self.device_info_var,
                                           font=self.FONT_LABEL, foreground=C.TEXT_SECONDARY)
         self._statusbar_left.pack(side="left")
+        # Neutral by default: pre-flight hints ("No audio files added") are
+        # not errors; _check_readiness switches to error red only for
+        # genuinely invalid input.
         self.readiness_label = ttk.Label(self._status_bar, textvariable=self.readiness_var,
-                                          foreground=self.CLR_ERROR_FG, font=self.FONT_LABEL)
+                                          foreground=C.TEXT_TERTIARY, font=self.FONT_LABEL)
         self.readiness_label.pack(side="left", padx=(16, 0))
         self._statusbar_right = ttk.Label(self._status_bar, text="",
                                            font=self.FONT_LABEL, foreground=C.TEXT_SECONDARY)
@@ -641,6 +627,18 @@ class TranscriberApp(tk.Tk):
         )
         self.start_button.pack(side="left", padx=(0, 8))
 
+        # Record button — live mic transcription (experimental, opt-in via Advanced Settings)
+        if _HAS_SOUNDDEVICE:
+            self.record_button = self._make_button(
+                action_bar, text="  Record  ",
+                command=self._toggle_recording, variant="secondary",
+                font=self.FONT_START, pady=10, padx=16,
+            )
+            if self._experimental_recording_var.get():
+                self.record_button.pack(side="left", padx=(0, 8))
+        else:
+            self.record_button = None
+
         # Run controls — hidden when idle, shown when running
         self._run_controls = ttk.Frame(action_bar)
         # NOT packed initially — shown by _show_run_controls()
@@ -651,7 +649,7 @@ class TranscriberApp(tk.Tk):
         self.stop_button = self._make_button(self._run_controls, text="Stop after current", command=self.request_stop_after_current)
         self.stop_button.pack(side="left", padx=(6, 0))
 
-        # Cancel button — separated from safe controls with extra gap (#2)
+        # Cancel button — separated from safe controls with extra gap
         self.cancel_button = self._make_button(action_bar, text="Cancel", command=self.request_cancel_now, variant="destructive")
         # NOT packed initially — shown alongside _run_controls when running
 
@@ -687,7 +685,7 @@ class TranscriberApp(tk.Tk):
         settings_card = tk.Frame(self._settings_container, background=_CARD_BG,
                                  highlightbackground=C.BORDER_CARD, highlightthickness=1)
         settings_card.pack(fill="x", pady=(6, 0))
-        settings_inner = tk.Frame(settings_card, background=_CARD_BG, padx=12, pady=8)
+        settings_inner = tk.Frame(settings_card, background=_CARD_BG, padx=4, pady=8)
         settings_inner.pack(fill="x")
 
         # Single row: Language | model info | Output folder + Browse | Advanced
@@ -703,7 +701,9 @@ class TranscriberApp(tk.Tk):
         self.language_combo = ttk.Combobox(
             settings_row, textvariable=self._lang_display_var, state="readonly",
             values=lang_display_values, width=14)
-        self.language_combo.grid(row=0, column=1, sticky="w")
+        # ipady lifts entry/combobox to the icon buttons' ~35px height so the
+        # options row sits on a single control height.
+        self.language_combo.grid(row=0, column=1, sticky="w", ipady=self._s(4))
         self.language_combo.bind("<<ComboboxSelected>>", lambda e: self._on_language_display_changed())
 
         # -- Separator --
@@ -713,20 +713,30 @@ class TranscriberApp(tk.Tk):
         # -- Output folder --
         tk.Label(settings_row, text="Output", font=self.FONT_LABEL,
                  background=_CARD_BG, foreground=C.TEXT_PRIMARY).grid(row=0, column=3, sticky="w", padx=(0, 6))
-        ttk.Entry(settings_row, textvariable=self.output_dir_var).grid(row=0, column=4, sticky="we")
+        ttk.Entry(settings_row, textvariable=self.output_dir_var).grid(row=0, column=4, sticky="we", ipady=self._s(4))
         self._browse_btn = self._make_button(settings_row, text="Browse", command=self.choose_output_dir, icon_name="browse")
         self._browse_btn.grid(row=0, column=5, padx=(6, 0))
+
+        # -- Identify speakers (only when the diarization engine is present) --
+        if _HAS_PYANNOTE:
+            self.diarize_check = ttk.Checkbutton(
+                settings_row, text="Identify speakers",
+                variable=self.diarize_var,
+            )
+            self.diarize_check.grid(row=0, column=6, padx=(12, 0))
+        else:
+            self.diarize_check = None
 
         # -- Keep awake --
         self._keep_awake_check = ttk.Checkbutton(
             settings_row, text="Keep awake",
             variable=self.prevent_sleep_var,
         )
-        self._keep_awake_check.grid(row=0, column=6, padx=(12, 0))
+        self._keep_awake_check.grid(row=0, column=7, padx=(12, 0))
 
         # -- Advanced gear --
         self._adv_btn = self._make_button(settings_row, text="Advanced\u2026", command=self._open_advanced_dialog, icon_name="gear")
-        self._adv_btn.grid(row=0, column=7, padx=(12, 0))
+        self._adv_btn.grid(row=0, column=8, padx=(12, 0))
 
         # Output entry stretches to fill available space
         settings_row.columnconfigure(4, weight=1)
@@ -739,7 +749,7 @@ class TranscriberApp(tk.Tk):
         # --- Advanced Settings Dialog (hidden at startup) ---
         self._build_advanced_dialog()
 
-        # --- State banner (#2): colored strip below settings, changes with app state ---
+        # --- State banner: colored strip below settings, changes with app state ---
         self._banner_frame = tk.Frame(self._header_frame, background=self.CLR_IDLE_BG, height=0)
         # Hidden initially — shown by _update_banner()
         self._banner_label = tk.Label(
@@ -753,6 +763,11 @@ class TranscriberApp(tk.Tk):
         self._paned = ttk.Panedwindow(root, orient="horizontal")
         self._paned.pack(fill="both", expand=True, pady=(6, 0))
         middle = self._paned
+        # Apply the intended 60/40 idle split once real geometry exists —
+        # without this the sash sat wherever clam left it (~80/20).
+        self._panel_ratio_initialized = False
+        self._user_panel_ratio: Optional[float] = None
+        self._paned.bind("<Configure>", self._init_panel_ratio_once, add="+")
 
         # Gutter padding: breathing room between panel content and the sash.
         # Right panel gets more (12px) because its heading text is flush against
@@ -768,13 +783,17 @@ class TranscriberApp(tk.Tk):
         ttk.Label(left, text="Audio queue", font=self.FONT_SECTION).pack(anchor="w")
         ttk.Label(left, text="Add files or folders to transcribe",
                   font=self.FONT_SMALL, foreground=C.TEXT_TERTIARY).pack(anchor="w", pady=(0, 8))
-        files_frame = ttk.Frame(left, padding=(10, 0))
+        # No extra padding: toolbar and tree share the heading's left edge
+        # (one content margin everywhere).
+        files_frame = ttk.Frame(left)
         files_frame.pack(fill="both", expand=True)
 
         toolbar = ttk.Frame(files_frame)
         toolbar.pack(fill="x", pady=(0, 10))
-        self._make_button(toolbar, text="Add files", command=self.add_files, icon_name="add-file").pack(side="left")
-        self._make_button(toolbar, text="Add folder", command=self.add_folder, icon_name="add-folder").pack(side="left", padx=(PAD_TOOLBAR_GAP, 0))
+        self._btn_add_files = self._make_button(toolbar, text="Add files", command=self.add_files, icon_name="add-file")
+        self._btn_add_files.pack(side="left")
+        self._btn_add_folder = self._make_button(toolbar, text="Add folder", command=self.add_folder, icon_name="add-folder")
+        self._btn_add_folder.pack(side="left", padx=(PAD_TOOLBAR_GAP, 0))
         self._btn_remove = self._make_button(toolbar, text="Remove", command=self.remove_selected_files, icon_name="remove")
         self._btn_remove.pack(side="left", padx=(PAD_TOOLBAR_GAP, 0))
         self._btn_clear = self._make_button(toolbar, text="Clear", command=self.clear_files, icon_name="clear")
@@ -783,27 +802,27 @@ class TranscriberApp(tk.Tk):
         self._set_button_enabled(self._btn_remove, False)
         self._set_button_enabled(self._btn_clear, False)
 
-        tree_container = ttk.Frame(files_frame)
-        tree_container.pack(fill="both", expand=True)
-
-        # Reorder buttons (vertical strip, left of treeview)
-        move_frame = ttk.Frame(tree_container)
-        move_inner = ttk.Frame(move_frame)
-        move_inner.pack(expand=True)  # expand centers vertically
-        self._btn_move_top = self._make_button(move_inner, text="", command=self._move_selection_top, icon_name="move-top")
-        self._btn_move_top.pack(side="top")
-        ToolTip(self._btn_move_top, "Move to top (Alt+Home)")
-        self._btn_move_up = self._make_button(move_inner, text="", command=self._move_selection_up, icon_name="move-up")
-        self._btn_move_up.pack(side="top", pady=(2, 0))
-        ToolTip(self._btn_move_up, "Move up (Alt+Up)")
-        self._btn_move_down = self._make_button(move_inner, text="", command=self._move_selection_down, icon_name="move-down")
-        self._btn_move_down.pack(side="top", pady=(2, 0))
-        ToolTip(self._btn_move_down, "Move down (Alt+Down)")
-        self._btn_move_bottom = self._make_button(move_inner, text="", command=self._move_selection_bottom, icon_name="move-bottom")
-        self._btn_move_bottom.pack(side="top", pady=(2, 0))
-        ToolTip(self._btn_move_bottom, "Move to bottom (Alt+End)")
+        # Reorder buttons live in the toolbar (right-aligned cluster) so the
+        # tree's left edge aligns with the toolbar instead of an off-grid
+        # floating gutter. Rightmost = move-bottom; visual order ⤒ ↑ ↓ ⤓.
+        _mod = "⌥" if sys.platform == "darwin" else "Alt+"
+        self._btn_move_bottom = self._make_button(toolbar, text="", command=self._move_selection_bottom, icon_name="move-bottom")
+        self._btn_move_bottom.pack(side="right")
+        ToolTip(self._btn_move_bottom, f"Move to bottom ({_mod}End)")
+        self._btn_move_down = self._make_button(toolbar, text="", command=self._move_selection_down, icon_name="move-down")
+        self._btn_move_down.pack(side="right", padx=(0, 2))
+        ToolTip(self._btn_move_down, f"Move down ({_mod}Down)")
+        self._btn_move_up = self._make_button(toolbar, text="", command=self._move_selection_up, icon_name="move-up")
+        self._btn_move_up.pack(side="right", padx=(0, 2))
+        ToolTip(self._btn_move_up, f"Move up ({_mod}Up)")
+        self._btn_move_top = self._make_button(toolbar, text="", command=self._move_selection_top, icon_name="move-top")
+        self._btn_move_top.pack(side="right", padx=(0, 2))
+        ToolTip(self._btn_move_top, f"Move to top ({_mod}Home)")
         for btn in (self._btn_move_top, self._btn_move_up, self._btn_move_down, self._btn_move_bottom):
             self._set_button_enabled(btn, False)
+
+        tree_container = ttk.Frame(files_frame)
+        tree_container.pack(fill="both", expand=True)
 
         self.file_tree = ttk.Treeview(
             tree_container,
@@ -814,38 +833,53 @@ class TranscriberApp(tk.Tk):
         )
         tree_vsb = ttk.Scrollbar(tree_container, orient="vertical", command=self.file_tree.yview)
         tree_hsb = ttk.Scrollbar(tree_container, orient="horizontal", command=self.file_tree.xview)
-        self.file_tree.configure(yscrollcommand=tree_vsb.set, xscrollcommand=tree_hsb.set)
 
+        # Auto-hide the horizontal scrollbar: a permanent full-width thumb is
+        # dead chrome (and it floated orphaned across the empty state).
+        def _on_tree_xscroll(first, last):
+            tree_hsb.set(first, last)
+            if float(first) <= 0.0 and float(last) >= 1.0:
+                tree_hsb.grid_remove()
+            else:
+                tree_hsb.grid()
+        self.file_tree.configure(yscrollcommand=tree_vsb.set,
+                                 xscrollcommand=_on_tree_xscroll)
+
+        # Headings anchored to match their cells; fixed-vocabulary columns
+        # sized to content with stretch=False so shrinkage never shears
+        # "Running" into "Runnin(" — File is the sole stretch column.
         self.file_tree.heading("ordinal", text="#")
-        self.file_tree.heading("status", text="Status")
-        self.file_tree.heading("progress", text="Progress")
-        self.file_tree.heading("duration", text="Duration")
-        self.file_tree.heading("file", text="File")
-        self.file_tree.heading("path", text="Path")
+        self.file_tree.heading("status", text="Status", anchor="w")
+        self.file_tree.heading("progress", text="Progress", anchor="w")
+        self.file_tree.heading("duration", text="Duration", anchor="e")
+        self.file_tree.heading("file", text="File", anchor="w")
+        self.file_tree.heading("path", text="Path", anchor="w")
         _s = self._s
         self.file_tree.column("ordinal", width=_s(32), minwidth=_s(28), anchor="center", stretch=False)
-        self.file_tree.column("status", width=_s(70), minwidth=_s(50), anchor="w")
-        self.file_tree.column("progress", width=_s(180), minwidth=_s(80), anchor="w")
-        self.file_tree.column("duration", width=_s(60), minwidth=_s(50), anchor="e")
+        self.file_tree.column("status", width=_s(72), minwidth=_s(64), anchor="w", stretch=False)
+        self.file_tree.column("progress", width=_s(150), minwidth=_s(84), anchor="w", stretch=False)
+        self.file_tree.column("duration", width=_s(64), minwidth=_s(64), anchor="e", stretch=False)
         self.file_tree.column("file", width=_s(220), minwidth=_s(100), anchor="w", stretch=True)
-        self.file_tree.column("path", width=_s(300), minwidth=_s(100), anchor="w")
+        self.file_tree.column("path", width=_s(300), minwidth=_s(100), anchor="w", stretch=False)
 
-        # #13: State colors + alternating row backgrounds
+        # State colors + alternating row backgrounds
         self.file_tree.tag_configure("queued", foreground=self.CLR_IDLE_FG)
-        self.file_tree.tag_configure("running", foreground=self.CLR_RUNNING_FG)
+        # The active row gets a subtle background so the eye finds it instantly
+        self.file_tree.tag_configure("running", foreground=self.CLR_RUNNING_FG,
+                                     background=C.HIGHLIGHT_HOVER)
         self.file_tree.tag_configure("done", foreground=self.CLR_SUCCESS_FG)
         self.file_tree.tag_configure("failed", foreground=self.CLR_ERROR_FG)
         self.file_tree.tag_configure("cancelled", foreground=self.CLR_WARNING_FG)
         self.file_tree.tag_configure("stripe", background=C.BG_STRIPE)
 
-        move_frame.grid(row=0, column=0, sticky="ns", padx=(0, 4))
         self.file_tree.grid(row=0, column=1, sticky="nsew")
         tree_vsb.grid(row=0, column=2, sticky="ns")
         tree_hsb.grid(row=1, column=1, sticky="ew")
+        tree_hsb.grid_remove()  # hidden until content actually overflows
         tree_container.rowconfigure(0, weight=1)
         tree_container.columnconfigure(1, weight=1)
 
-        # #10: Progress bar overlays drawn as tk.Frame widgets placed on the treeview.
+        # Progress bar overlays drawn as tk.Frame widgets placed on the treeview.
         # Each visible row with progress gets a thin bar widget at the bottom of its
         # "progress" column cell. Bars are children of the treeview (scroll with it)
         # and are non-interactive (no event bindings).
@@ -856,9 +890,17 @@ class TranscriberApp(tk.Tk):
             tree_vsb.set(*args)
             self._redraw_tree_progress()
         self.file_tree.configure(yscrollcommand=_on_tree_scroll)
-        self.file_tree.bind("<Configure>", lambda e: self.after(50, self._redraw_tree_progress))
 
-        # Empty state (#9): clear call-to-action when queue is empty
+        def _on_tree_resize(_e=None):
+            self._redraw_tree_progress()
+            self._reelide_tree_names()
+        self.file_tree.bind("<Configure>", lambda e: self.after(50, _on_tree_resize))
+        # Column drag-resizes don't fire <Configure>; catch the release.
+        self.file_tree.bind("<ButtonRelease-1>",
+                            lambda e: self.after(50, self._reelide_tree_names),
+                            add="+")
+
+        # Empty state: clear call-to-action when queue is empty
         self._empty_frame = tk.Frame(tree_container, background=C.BG_PRIMARY)
         self._empty_frame.grid(row=0, column=0, columnspan=3, sticky="nsew")
         self._empty_frame.lift()
@@ -899,6 +941,11 @@ class TranscriberApp(tk.Tk):
         self._tree_menu.add_command(label="Move down", command=self._move_selection_down)
         self._tree_menu.add_command(label="Move to bottom", command=self._move_selection_bottom)
         self.file_tree.bind("<Button-3>", self._on_tree_right_click)
+        if sys.platform == "darwin":
+            # macOS Aqua delivers the secondary (right) click as Button-2, so the
+            # queue context menu never opens on <Button-3> alone (matches the
+            # Activity tree's darwin binding).
+            self.file_tree.bind("<Button-2>", self._on_tree_right_click)
         self.file_tree.bind("<Double-1>", self._on_tree_double_click)
 
         # Keyboard shortcuts for reorder
@@ -930,7 +977,7 @@ class TranscriberApp(tk.Tk):
         details_frame = ttk.Frame(right, padding=(10, 0))
         details_frame.pack(fill="both", expand=True)
 
-        # --- Idle panel (#3): onboarding prompt shown when no job has run ---
+        # --- Idle panel: onboarding prompt shown when no job has run ---
         self._idle_panel = tk.Frame(details_frame, background=C.BG_PRIMARY)
         self._idle_panel.pack(fill="both", expand=True)
         # Center vertically
@@ -946,6 +993,58 @@ class TranscriberApp(tk.Tk):
             font=(SYSTEM_FONT, _fs(12)), foreground=C.TEXT_SECONDARY, background=C.BG_PRIMARY,
         ).pack(anchor="w")
 
+        # --- Recording panel (hidden initially, shown when recording) ---
+        self._recording_panel = tk.Frame(details_frame, background=C.BG_PRIMARY)
+        # NOT packed initially — shown by _start_recording()
+
+        rec_inner = tk.Frame(self._recording_panel, background=C.BG_PRIMARY)
+        rec_inner.pack(fill="both", expand=True, padx=4, pady=4)
+
+        # Recording status line
+        self._rec_status_var = tk.StringVar(value="")
+        self._rec_status_label = tk.Label(
+            rec_inner, textvariable=self._rec_status_var,
+            font=(SYSTEM_FONT, _fs(11)), foreground=C.TEXT_SECONDARY,
+            background=C.BG_PRIMARY, anchor="w",
+        )
+        self._rec_status_label.pack(fill="x", pady=(0, 6))
+
+        # Audio level bar
+        self._rec_level_frame = tk.Frame(rec_inner, background=C.BORDER_CARD, height=6)
+        self._rec_level_frame.pack(fill="x", pady=(0, 8))
+        self._rec_level_frame.pack_propagate(False)
+        # Red, not brand blue: the level meter reads as live capture.
+        self._rec_level_bar = tk.Frame(self._rec_level_frame, background=C.BTN_DESTRUCTIVE_FG, width=0)
+        self._rec_level_bar.place(x=0, y=0, relheight=1.0, width=0)
+
+        # Recording text area (same pattern as preview_text)
+        rec_text_frame = tk.Frame(rec_inner, background=C.BG_PRIMARY)
+        rec_text_frame.pack(fill="both", expand=True)
+        self._rec_text = tk.Text(
+            rec_text_frame, height=14, wrap="word",
+            font=(SYSTEM_FONT, _fs(12)),
+            background=C.BG_ELEVATED, foreground=C.TEXT_PRIMARY,
+            insertbackground=C.TEXT_PRIMARY,
+            relief="flat", borderwidth=0,
+            highlightthickness=1, highlightbackground=C.BORDER_CARD,
+            highlightcolor=C.BORDER_CARD,
+            padx=self._s(12), pady=self._s(10),
+            spacing1=self._s(2), spacing3=self._s(8),
+        )
+        self._rec_text.tag_configure("rtl", justify="right")
+        self._rec_text.tag_configure("ltr", justify="left")
+        rec_vsb = ttk.Scrollbar(rec_text_frame, orient="vertical", command=self._rec_text.yview)
+        self._rec_text.configure(yscrollcommand=rec_vsb.set)
+        self._rec_text.pack(side="left", fill="both", expand=True)
+        rec_vsb.pack(side="right", fill="y")
+
+        # Recording toolbar (copy, clear, save)
+        rec_toolbar = tk.Frame(rec_inner, background=C.BG_PRIMARY)
+        rec_toolbar.pack(fill="x", pady=(6, 0))
+        self._make_button(rec_toolbar, text="Copy", command=self._copy_rec_text).pack(side="left", padx=(0, 6))
+        self._make_button(rec_toolbar, text="Clear", command=self._clear_rec_text).pack(side="left", padx=(0, 6))
+        self._make_button(rec_toolbar, text="Save to file", command=self._save_rec_text).pack(side="left")
+
         # --- Run details (hidden initially, replace idle panel on first run) ---
         self._run_details_frame = ttk.Frame(details_frame)
         # NOT packed initially — shown by _show_stats() on first run
@@ -956,7 +1055,7 @@ class TranscriberApp(tk.Tk):
         ttk.Label(summary, textvariable=self.overall_summary_var, font=self.FONT_LABEL,
                   foreground=C.TEXT_MUTED).pack(anchor="w", pady=(2, 0))
 
-        # --- Card: Current File (#4: blue left accent border) ---
+        # --- Card: Current File (blue left accent border) ---
         self._stats_frame = ttk.Frame(self._run_details_frame)
         self._stats_frame.pack(fill="x")
 
@@ -1022,7 +1121,17 @@ class TranscriberApp(tk.Tk):
         self._copy_preview_btn.pack(side="right")
         preview_container = ttk.Frame(preview_tab)
         preview_container.pack(fill="both", expand=True)
-        self.preview_text = tk.Text(preview_container, height=14, wrap="word")
+        self.preview_text = tk.Text(
+            preview_container, height=14, wrap="word",
+            font=(SYSTEM_FONT, _fs(11)),
+            background=C.BG_ELEVATED, foreground=C.TEXT_PRIMARY,
+            insertbackground=C.TEXT_PRIMARY,
+            relief="flat", borderwidth=0,
+            highlightthickness=1, highlightbackground=C.BORDER_CARD,
+            highlightcolor=C.BORDER_CARD,
+            padx=self._s(12), pady=self._s(8),
+            spacing1=self._s(1), spacing3=self._s(4),
+        )
         # RTL/LTR tag for Hebrew vs other languages
         self.preview_text.tag_configure("rtl", justify="right")
         self.preview_text.tag_configure("ltr", justify="left")
@@ -1081,7 +1190,17 @@ class TranscriberApp(tk.Tk):
 
         # --- Raw view (existing tk.Text) ---
         self._log_raw_frame = ttk.Frame(log_tab)
-        self.log_text = tk.Text(self._log_raw_frame, height=14, wrap="word")
+        # Deliberate monospace for the raw log (matches the crash dialog);
+        # the defect was the implicit TkFixedFont fallback and zero padding.
+        self.log_text = tk.Text(
+            self._log_raw_frame, height=14, wrap="word",
+            font=("Consolas" if sys.platform == "win32" else "Menlo", _fs(9)),
+            background=C.BG_ELEVATED, foreground=C.TEXT_PRIMARY,
+            relief="flat", borderwidth=0,
+            highlightthickness=1, highlightbackground=C.BORDER_CARD,
+            highlightcolor=C.BORDER_CARD,
+            padx=self._s(10), pady=self._s(8),
+        )
         # Color-coded log tags
         self.log_text.tag_configure("info", foreground=C.TEXT_PRIMARY)
         self.log_text.tag_configure("warning", foreground=C.STATUS_WARNING_FG)
@@ -1109,7 +1228,7 @@ class TranscriberApp(tk.Tk):
 
         self._apply_tooltips()
 
-    # --- Keyboard shortcuts (#16) ---
+    # --- Keyboard shortcuts ---
 
     def _on_ctrl_enter(self, event=None) -> None:
         """Ctrl+Enter: start transcription (if ready and not running)."""
@@ -1133,7 +1252,7 @@ class TranscriberApp(tk.Tk):
         self.refresh_models()
 
     def _on_close(self) -> None:
-        """Handle window close. Confirm if a transcription job is running."""
+        """Handle window close. Confirm if a transcription job or recording is active."""
         if self.worker_thread and self.worker_thread.is_alive():
             if not messagebox.askyesno(
                 "Quit?",
@@ -1141,6 +1260,17 @@ class TranscriberApp(tk.Tk):
                 parent=self,
             ):
                 return
+        if self._recorder is not None and self._recorder.is_recording():
+            # wait=False: never join recorder threads on the main thread
+            # while closing — they are daemons, process exit reaps them.
+            self._recorder.stop(wait=False)
+            self._recorder = None
+        # Persist settings changed since the last run start — best
+        # effort: a save failure must never block quitting.
+        try:
+            self.save_config_from_ui()
+        except Exception:
+            logger.debug("Config save on close failed", exc_info=True)
         self._sleep_inhibitor.release()
         self.destroy()
 
@@ -1225,7 +1355,7 @@ class TranscriberApp(tk.Tk):
                 "Lower precision = faster + less memory, slightly less accurate.")
         ToolTip(self.beam_entry,
                 "Beam search width. Higher = more accurate, slower.\n"
-                "Default: 5. Range: 1-10.")
+                "Default: 5. Minimum: 1; above 10 gives little benefit.")
         ToolTip(self.vad_check,
                 "Voice Activity Detection. Skips silent sections\n"
                 "for faster processing. Only works with faster-whisper.")
@@ -1237,6 +1367,17 @@ class TranscriberApp(tk.Tk):
                 "Feed previous segment text as context for the next.\n"
                 "Off = faster, fewer hallucination loops.\n"
                 "On = better coherence across segments.")
+        if self.diarize_check is not None:
+            ToolTip(self.diarize_check,
+                    "Label each line with the speaker (Speaker 1, Speaker 2, ...).\n"
+                    "Runs after transcription and roughly doubles processing time.")
+        ToolTip(self.num_speakers_entry,
+                "0 = auto-detect. Set the exact count if you know it\n"
+                "(e.g. 2 for an interview) — improves accuracy.")
+        if getattr(self, "diarize_device_combo", None) is not None:
+            ToolTip(self.diarize_device_combo,
+                    "Auto uses Apple Silicon GPU acceleration (MPS) when\n"
+                    "available. Choose CPU on machines with 8 GB RAM.")
         ToolTip(self._keep_awake_check,
                 "Prevent the computer from sleeping during transcription.\n"
                 "Recommended for long batches that run unattended.")
@@ -1244,6 +1385,8 @@ class TranscriberApp(tk.Tk):
         # Card tooltips (live-updated via _refresh_breathing_lines)
         self._file_card_tooltip = ToolTip(self._file_card_outer, "")
         self._batch_card_tooltip = ToolTip(self._batch_card, "")
+        ToolTip(self._btn_clear,
+                "Clear the file list and reset this session's\nactivity log and statistics")
         ToolTip(self.start_button, "Start transcription  (Ctrl+Enter)")
         ToolTip(self.pause_button, "Pause at the next safe point")
         ToolTip(self.resume_button, "Resume transcription")
@@ -1255,9 +1398,9 @@ class TranscriberApp(tk.Tk):
         _s = self._s
         self._adv_dialog = tk.Toplevel(self)
         self._adv_dialog.title("Advanced Settings")
-        self._adv_dialog.geometry(f"{_s(600)}x{_s(420)}")
+        self._adv_dialog.geometry(f"{_s(600)}x{_s(400)}")
         self._adv_dialog.resizable(True, True)
-        self._adv_dialog.minsize(_s(500), _s(360))
+        self._adv_dialog.minsize(_s(500), _s(380))
         if self._icon_path:
             self._adv_dialog.iconbitmap(self._icon_path)
         self._adv_dialog.protocol("WM_DELETE_WINDOW", self._adv_dialog.withdraw)
@@ -1296,7 +1439,7 @@ class TranscriberApp(tk.Tk):
             row=0, column=1, sticky="w", padx=(_s(28), 0))
         self.task_combo = ttk.Combobox(
             engine_grid, textvariable=self.task_var, state="readonly",
-            values=["transcribe", "translate"], width=14)
+            values=["transcribe", "translate"], width=18)
         self.task_combo.grid(row=1, column=1, sticky="w", padx=(_s(28), 0), pady=(_s(4), 0))
 
         # Row 2: Device + Compute type
@@ -1305,7 +1448,7 @@ class TranscriberApp(tk.Tk):
             row=2, column=0, sticky="w", pady=(_s(16), 0))
         self.device_combo = ttk.Combobox(
             engine_grid, textvariable=self.device_var, state="readonly",
-            values=["auto", "cpu", "cuda"], width=14)
+            values=["auto", "cpu", "cuda"], width=18)
         self.device_combo.grid(row=3, column=0, sticky="w", pady=(_s(4), 0))
 
         tk.Label(engine_grid, text="Compute type", font=self.FONT_SMALL,
@@ -1314,7 +1457,7 @@ class TranscriberApp(tk.Tk):
         self.compute_combo = ttk.Combobox(
             engine_grid, textvariable=self.compute_type_var, state="readonly",
             values=["auto", "default", "int8", "int8_float16", "float16", "float32"],
-            width=14)
+            width=18)
         self.compute_combo.grid(row=3, column=1, sticky="w", padx=(_s(28), 0), pady=(_s(4), 0))
 
         # ── Tab 2: Quality ──
@@ -1365,6 +1508,61 @@ class TranscriberApp(tk.Tk):
             variable=self.condition_on_previous_text_var)
         self.cond_prev_check.pack(anchor="w", pady=(_s(6), 0))
 
+        # ── Speakers group (diarization) ──
+        # Always built; when the engine is absent the controls are disabled
+        # and the hint carries the install line (visible-with-hint precedent
+        # of the experimental-recording toggle below).
+        ttk.Separator(quality_tab, orient="horizontal").pack(
+            fill="x", pady=(_s(16), _s(12)))
+        tk.Label(quality_tab, text="Speakers", font=self.FONT_SMALL,
+                 background=C.BG_PRIMARY, foreground=C.TEXT_SECONDARY).pack(
+            anchor="w")
+
+        speakers_grid = tk.Frame(quality_tab, background=C.BG_PRIMARY)
+        speakers_grid.pack(anchor="w", pady=(_s(4), 0))
+
+        tk.Label(speakers_grid, text="Number of speakers", font=self.FONT_SMALL,
+                 background=C.BG_PRIMARY, foreground=C.TEXT_SECONDARY).grid(
+            row=0, column=0, sticky="w")
+        self.num_speakers_entry = ttk.Entry(
+            speakers_grid, textvariable=self.num_speakers_var, width=6)
+        self.num_speakers_entry.grid(row=1, column=0, sticky="w",
+                                     pady=(_s(4), 0))
+
+        if sys.platform == "darwin":
+            tk.Label(speakers_grid, text="Processing device",
+                     font=self.FONT_SMALL, background=C.BG_PRIMARY,
+                     foreground=C.TEXT_SECONDARY).grid(
+                row=0, column=1, sticky="w", padx=(_s(28), 0))
+            self._diarize_device_display_var = tk.StringVar(
+                value=self._DIARIZE_DEVICE_DISPLAY.get(
+                    self.diarize_device_var.get(), "Auto (MPS)"))
+            self.diarize_device_combo = ttk.Combobox(
+                speakers_grid, textvariable=self._diarize_device_display_var,
+                state="readonly",
+                values=list(self._DIARIZE_DEVICE_DISPLAY.values()), width=12)
+            self.diarize_device_combo.grid(
+                row=1, column=1, sticky="w", padx=(_s(28), 0), pady=(_s(4), 0))
+            self.diarize_device_combo.bind(
+                "<<ComboboxSelected>>",
+                lambda e: self._on_diarize_device_display_changed())
+        else:
+            # Non-mac platforms have no device choice: the worker's "auto"
+            # resolves to CUDA-if-available, else CPU.
+            self.diarize_device_combo = None
+
+        speakers_hint = "0 = detect the number of speakers automatically."
+        if not _HAS_PYANNOTE:
+            # The project is not on PyPI — quote the README's real command.
+            speakers_hint += ('\nRequires: pip install -e ".[diarization]" '
+                              "from the project root")
+            self.num_speakers_entry.configure(state="disabled")
+            if self.diarize_device_combo is not None:
+                self.diarize_device_combo.configure(state="disabled")
+        tk.Label(quality_tab, text=speakers_hint, font=self.FONT_SMALL,
+                 background=C.BG_PRIMARY, foreground=C.TEXT_TERTIARY,
+                 justify="left", anchor="w").pack(anchor="w", pady=(_s(4), 0))
+
         # ── Tab 3: Output ──
         output_tab = ttk.Frame(notebook, padding=(_s(24), _s(20)))
         notebook.add(output_tab, text="Output")
@@ -1379,6 +1577,25 @@ class TranscriberApp(tk.Tk):
             ttk.Checkbutton(
                 fmt_row, text=fmt.upper(),
                 variable=self.format_vars[fmt]).pack(side="left", padx=(0, _s(20)))
+
+        # --- Experimental features (below tabs, above footer) ---
+        ttk.Separator(self._adv_dialog, orient="horizontal").pack(
+            fill="x", padx=_s(16), pady=(_s(10), 0))
+        exp_frame = tk.Frame(self._adv_dialog, background=C.BG_PRIMARY)
+        exp_frame.pack(fill="x", padx=_s(24), pady=(_s(8), _s(4)))
+        ttk.Checkbutton(
+            exp_frame, text="Enable live recording (experimental)",
+            variable=self._experimental_recording_var,
+            command=self._update_recording_visibility,
+        ).pack(anchor="w")
+        exp_desc = "Real-time speech-to-text from your microphone."
+        if not _HAS_SOUNDDEVICE:
+            exp_desc += "\nRequires: pip install sounddevice silero-vad faster-whisper"
+        tk.Label(
+            exp_frame, text=exp_desc, font=self.FONT_SMALL,
+            background=C.BG_PRIMARY, foreground=C.TEXT_TERTIARY,
+            justify="left", anchor="w",
+        ).pack(anchor="w", padx=(_s(24), 0))
 
         # --- Footer (below tabs, always visible) ---
         footer_border = tk.Frame(
@@ -1398,9 +1615,9 @@ class TranscriberApp(tk.Tk):
             background=C.BG_PRIMARY, foreground=C.TEXT_TERTIARY)
         self._selftest_status.pack(side="left", padx=(_s(8), 0))
 
-        # Right: OK button
+        # Right: OK button — primary variant marks the dialog's main action
         self._make_button(
-            footer, text="OK",
+            footer, text="    OK    ", variant="primary",
             command=self._adv_dialog.withdraw).pack(side="right")
 
         # Right (before OK): model cache
@@ -1417,12 +1634,29 @@ class TranscriberApp(tk.Tk):
                 "You can delete models here to free disk space.")
 
     def _open_advanced_dialog(self) -> None:
-        """Show the advanced settings dialog, centered on parent."""
+        """Show the advanced settings dialog sized to its content, centered on parent."""
+        _s = self._s
         self._adv_dialog.deiconify()
         self._adv_dialog.update_idletasks()
-        x = self.winfo_x() + (self.winfo_width() - self._adv_dialog.winfo_width()) // 2
-        y = self.winfo_y() + (self.winfo_height() - self._adv_dialog.winfo_height()) // 2
-        self._adv_dialog.geometry(f"+{x}+{y}")
+        # Size to content: the tabs and the experimental section have outgrown
+        # the old fixed 600x480, which clipped the bottom button row until the
+        # user resized by hand. reqheight covers the tallest notebook tab.
+        scr_w, scr_h = self.winfo_screenwidth(), self.winfo_screenheight()
+        req_w = max(_s(600), self._adv_dialog.winfo_reqwidth())
+        req_w = min(req_w, scr_w - _s(40))
+        req_h = max(_s(400), self._adv_dialog.winfo_reqheight())
+        req_h = min(req_h, scr_h - _s(120))
+        px, py = self.winfo_x(), self.winfo_y()
+        x = px + (self.winfo_width() - req_w) // 2
+        y = py + (self.winfo_height() - req_h) // 2
+        # Clamp to the screen rect (max last, so the title bar always stays
+        # reachable) — but only when the parent is on the primary display:
+        # Tk reports only the primary monitor's size on Windows, and yanking
+        # a dialog from a secondary monitor to x=0 is worse than no clamp.
+        if 0 <= px < scr_w and 0 <= py < scr_h:
+            x = max(0, min(x, scr_w - req_w))
+            y = max(0, min(y, scr_h - req_h))
+        self._adv_dialog.geometry(f"{req_w}x{req_h}+{x}+{y}")
         self._adv_dialog.lift()
         self._adv_dialog.focus_set()
 
@@ -1460,7 +1694,9 @@ class TranscriberApp(tk.Tk):
             return
 
         self._selftest_btn.configure(state="disabled", text="\u231b Testing\u2026")
-        self._selftest_status.configure(text="Running 6 checks\u2026", foreground=C.TEXT_TERTIARY)
+        self._selftest_status.configure(
+            text=f"Running {SELFTEST_CHECK_COUNT} checks\u2026",
+            foreground=C.TEXT_TERTIARY)
         self._selftest_thread = threading.Thread(
             target=self._selftest_worker, daemon=True)
         self._selftest_thread.start()
@@ -1509,8 +1745,7 @@ class TranscriberApp(tk.Tk):
         dlg = tk.Toplevel(self)
         title = "Self-test passed" if result.passed else "Self-test failed"
         dlg.title(title)
-        dlg.geometry(f"{self._s(480)}x{self._s(320)}")
-        dlg.resizable(False, False)
+        dlg.resizable(True, True)
         dlg.configure(background=C.BG_PRIMARY)
         dlg.transient(self._adv_dialog)
         if self._icon_path:
@@ -1523,9 +1758,12 @@ class TranscriberApp(tk.Tk):
         ttk.Label(frame, text=title, font=self.FONT_SECTION,
                   foreground=color).pack(anchor="w")
 
+        # Explicit width/height: an unbounded Text requests 24 rows, which
+        # pushed the Close button below the old fixed 480x320 dialog.
         text = tk.Text(frame, wrap="word", font=self.FONT_SMALL,
                        background=C.BG_CARD, foreground=C.TEXT_HEADING,
-                       relief="flat", borderwidth=0, padx=8, pady=8)
+                       relief="flat", borderwidth=0, padx=8, pady=8,
+                       width=64, height=14)
         text.pack(fill="both", expand=True, pady=(8, 0))
         report = "\n".join(result.checks)
         if result.error:
@@ -1536,23 +1774,104 @@ class TranscriberApp(tk.Tk):
         self._make_button(frame, text="Close",
                           command=dlg.destroy).pack(anchor="e", pady=(8, 0))
 
+        # Size to content, centered on the Advanced dialog, clamped to the
+        # primary screen (Tk can't see other monitors' bounds on Windows).
+        dlg.update_idletasks()
+        scr_w, scr_h = self.winfo_screenwidth(), self.winfo_screenheight()
+        w = min(max(self._s(480), dlg.winfo_reqwidth()), scr_w - self._s(40))
+        h = min(dlg.winfo_reqheight(), scr_h - self._s(80))
+        parent = self._adv_dialog
+        x = parent.winfo_x() + (parent.winfo_width() - w) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - h) // 2
+        if 0 <= parent.winfo_x() < scr_w and 0 <= parent.winfo_y() < scr_h:
+            x = max(0, min(x, scr_w - w))
+            y = max(0, min(y, scr_h - h))
+        dlg.geometry(f"{w}x{h}+{x}+{y}")
+
     def _show_stats(self) -> None:
-        """Reveal the run details panel (hidden until first run). Hides idle panel."""
+        """Reveal the run details panel (hidden until first run). Hides idle/recording panels."""
         self._hide_idle_panel()
+        if self._recording_panel.winfo_manager():
+            self._recording_panel.pack_forget()
+            self._restore_pre_recording_sash()
         if not self._run_details_frame.winfo_manager():
             self._run_details_frame.pack(fill="both", expand=True)
 
+    @staticmethod
+    def _bidi_display(text: str, rtl: bool) -> str:
+        """Wrap each line in RLM marks for display when the text is RTL.
+
+        Tk resolves neutral characters (. , ! ? …) by the PARAGRAPH direction,
+        which is always LTR — so a sentence-final period on a Hebrew line
+        rendered on the wrong (right) side. Surrounding RLMs make trailing/
+        leading neutrals resolve as RTL. Display-only: Copy/Save strip them.
+        """
+        if not rtl:
+            return text
+        rlm = chr(0x200F)  # RIGHT-TO-LEFT MARK (invisible)
+        return "\n".join(
+            rlm + line + rlm if line.strip() else line
+            for line in text.split("\n"))
+
+    def _widen_for_recording(self) -> None:
+        """Give the dictation panel real width: the default split favors the
+        queue and left the live transcript a hard-to-read ~20% column."""
+        try:
+            total = self._paned.winfo_width()
+            cur = self._paned.sashpos(0)
+            if total > 50 and (total - cur) < int(total * 0.42):
+                self._pre_recording_sash = cur
+                self._set_panel_ratio(0.55)
+            else:
+                self._pre_recording_sash = None
+        except Exception:
+            self._pre_recording_sash = None
+
+    def _restore_pre_recording_sash(self) -> None:
+        """Undo the sash widening done for the dictation panel — but only if
+        the sash is still where recording put it (never clobber a user drag)."""
+        prev = getattr(self, "_pre_recording_sash", None)
+        self._pre_recording_sash = None
+        if prev is None:
+            return
+        try:
+            total = self._paned.winfo_width()
+            if total > 50 and abs(self._paned.sashpos(0) - int(total * 0.55)) <= self._s(24):
+                self._paned.sashpos(0, prev)
+                self._reposition_grip()
+        except Exception:
+            pass
+
     def _hide_idle_panel(self) -> None:
-        """Hide the idle onboarding panel (#3)."""
+        """Hide the idle onboarding panel."""
         if self._idle_panel.winfo_manager():
             self._idle_panel.pack_forget()
         self._run_subtitle.configure(text="Live progress and preview will appear here")
 
     def _show_idle_panel(self) -> None:
-        """Show the idle onboarding panel (#3), hide run details."""
+        """Show the idle onboarding panel, hide run details."""
         if not self._idle_panel.winfo_manager():
             self._idle_panel.pack(fill="both", expand=True)
         self._run_subtitle.configure(text="")
+
+    def _init_panel_ratio_once(self, _event=None) -> None:
+        """One-shot: set the idle 60/40 split as soon as the paned window
+        has real width (a plain <Map> can fire while width is still 1)."""
+        if self._panel_ratio_initialized or self._paned.winfo_width() <= 50:
+            return
+        self._panel_ratio_initialized = True
+        self._set_panel_ratio(0.6)
+
+    def _apply_panel_ratio(self, default: float) -> None:
+        """State-transition ratio changes honor a user-dragged sash."""
+        ratio = self._user_panel_ratio
+        self._set_panel_ratio(ratio if ratio is not None else default)
+
+    def _clamp_sash(self, sash_x: int, total: int) -> int:
+        """Keep both panes usable: the queue toolbar (buttons + reorder
+        cluster) needs ~600px before controls collide, and the run panel
+        needs room to breathe."""
+        return max(self._s(600), min(sash_x, total - self._s(360)))
 
     def _set_panel_ratio(self, left_pct: float) -> None:
         """Set the paned window sash position as a percentage for the left pane."""
@@ -1560,7 +1879,7 @@ class TranscriberApp(tk.Tk):
             total = self._paned.winfo_width()
             if total < 50:
                 return  # window not yet mapped
-            sash_x = int(total * left_pct)
+            sash_x = self._clamp_sash(int(total * left_pct), total)
             self._paned.sashpos(0, sash_x)
             self._reposition_grip()
         except Exception:
@@ -1651,14 +1970,22 @@ class TranscriberApp(tk.Tk):
     def _on_grip_drag(self, event) -> None:
         """Forward drag from the pill Canvas to the PanedWindow sash."""
         x = event.x_root - self._drag_paned_x0
+        x = self._clamp_sash(x, self._paned.winfo_width())
         self._paned.sashpos(0, x)
         self._reposition_grip()
 
     def _on_grip_release(self, _event) -> None:
         self._reposition_grip()
+        # Remember the user's chosen split so state transitions honor it.
+        try:
+            total = self._paned.winfo_width()
+            if total > 50:
+                self._user_panel_ratio = self._paned.sashpos(0) / total
+        except Exception:
+            pass
 
     def _update_statusbar_file_info(self) -> None:
-        """Update the right side of the status bar with file count + total duration (#12)."""
+        """Update the right side of the status bar with file count + total duration."""
         n = len(self.file_paths)
         if n == 0:
             self._statusbar_right.config(text="")
@@ -1683,6 +2010,24 @@ class TranscriberApp(tk.Tk):
         "quality":  "Beam=5, VAD on, context carry  --  best accuracy",
         "custom":   "Manual control over all parameters",
     }
+
+    _DIARIZE_DEVICE_DISPLAY = {"auto": "Auto (MPS)", "cpu": "CPU"}
+
+    @staticmethod
+    def _diarize_enabled_initial(config_value: object,
+                                 engine_available: bool) -> bool:
+        """Initial diarize-checkbox state: the saved preference, forced off
+        when the engine is absent (a stale saved True must never yield a
+        checked-but-hidden checkbox that blocks Start via readiness)."""
+        return bool(config_value) and engine_available
+
+    def _on_diarize_device_display_changed(self) -> None:
+        """Translate the device display name back to its config code."""
+        display = self._diarize_device_display_var.get()
+        for code, name in self._DIARIZE_DEVICE_DISPLAY.items():
+            if name == display:
+                self.diarize_device_var.set(code)
+                break
 
     def _apply_speed_preset(self, _event=None) -> None:
         """Apply the selected speed preset to the advanced controls."""
@@ -1761,9 +2106,9 @@ class TranscriberApp(tk.Tk):
         # 4. For 'auto' or no match, keep current selection
 
     def _update_banner(self, state: str, text: str = "") -> None:
-        """Update the state banner (#2): color + text based on app state.
+        """Update the state banner: color + text based on app state.
 
-        Uses a brief fade animation (#16) when transitioning between states.
+        Uses a brief fade animation when transitioning between states.
         """
         color_map = {
             "idle":     (self.CLR_IDLE_BG,    self.CLR_IDLE_FG),
@@ -1774,18 +2119,17 @@ class TranscriberApp(tk.Tk):
             "error":    (self.CLR_ERROR_BG,    self.CLR_ERROR_FG),
         }
         target_bg, fg = color_map.get(state, color_map["idle"])
-        if state == "idle" and not text:
-            # Hide banner when idle with no message
-            if self._banner_frame.winfo_manager():
-                self._banner_frame.pack_forget()
-            self._banner_last_state = "idle"
-            return
         if not self._banner_frame.winfo_manager():
-            # Banner is packed inside _header_frame at the top of the content
-            # area, above the PanedWindow.  Settings lives in _footer_frame.
+            # Always packed (invisible strip when idle) so the banner's
+            # appearance never shifts the whole layout down by a row.
             self._banner_frame.pack(fill="x", pady=(4, 0), in_=self._header_frame)
+        if state == "idle" and not text:
+            self._banner_last_state = "idle"
+            self._banner_frame.configure(background=C.BG_PRIMARY)
+            self._banner_label.configure(text="", background=C.BG_PRIMARY)
+            return
         self._banner_label.configure(text=text, foreground=fg)
-        # #16: Animate background transition
+        # Animate background transition
         prev_state = getattr(self, "_banner_last_state", "idle")
         self._banner_last_state = state
         if prev_state != state:
@@ -1827,8 +2171,8 @@ class TranscriberApp(tk.Tk):
         return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
 
     def _count_by_status(self) -> dict:
-        """Scan the tree and return counts by status: Queued, Done, Failed, Running."""
-        counts = {"Queued": 0, "Done": 0, "Failed": 0, "Running": 0}
+        """Scan the tree and return counts by status: Queued, Done, Failed, Running, Cancelled."""
+        counts = {"Queued": 0, "Done": 0, "Failed": 0, "Running": 0, "Cancelled": 0}
         for item_id in self.file_items.values():
             if not self.file_tree.exists(item_id):
                 continue
@@ -1837,18 +2181,25 @@ class TranscriberApp(tk.Tk):
                 counts[status] += 1
         return counts
 
-    def _update_contextual_banner(self) -> None:
+    def _update_contextual_banner(self, worker_finished: bool = False) -> None:
         """Update banner and start button to reflect the queue's current state.
 
         Called after any mutation that changes file statuses outside of a running
         job: _append_files, remove_selected_files, clear_files, _retry_failed,
         and the 'done' event handler.
+
+        worker_finished=True bypasses the is_alive() guard: during the 'done'
+        event drain the worker thread may still be tearing down (model unload
+        can outlast the 120 ms poll), yet the run is logically over and the
+        Continue button text must be set now, not never.
         """
-        if self.worker_thread and self.worker_thread.is_alive():
+        if not worker_finished and self.worker_thread and self.worker_thread.is_alive():
             return  # running state is managed by _apply_app_state("running")
 
         counts = self._count_by_status()
-        queued = counts["Queued"]
+        # Start requeues Cancelled rows (see _requeue_cancelled), so they count
+        # toward what a Start/Continue press would actually run.
+        queued = counts["Queued"] + counts["Cancelled"]
         done = counts["Done"]
         failed = counts["Failed"]
         has_history = done > 0 or failed > 0
@@ -1859,7 +2210,10 @@ class TranscriberApp(tk.Tk):
                 parts.append(f"{done} done")
             if failed > 0:
                 parts.append(f"{failed} failed")
-            parts.append(f"{queued} queued")
+            if counts["Cancelled"] > 0:
+                parts.append(f"{counts['Cancelled']} cancelled")
+            if counts["Queued"] > 0:
+                parts.append(f"{counts['Queued']} queued")
             self._update_banner("ready", " \u00b7 ".join(parts) + " \u2014 ready to continue")
             self.title(APP_TITLE)
             self._taskbar.clear()
@@ -1884,14 +2238,26 @@ class TranscriberApp(tk.Tk):
         """Transform the UI based on application state: 'idle', 'running', or 'complete'.
 
         kwargs for 'running': idx (int), total (int), filename (str), file_pct (float)
-        kwargs for 'complete': message (str), done (int), failed (int), wall_seconds (float)
+        kwargs for 'complete': message (str), done (int), failed (int), wall_seconds (float),
+                               cancelled (bool), stopped (bool)
         """
         if state == "running":
             idx = kwargs.get("idx", 0)
             total = kwargs.get("total", 0)
             filename = kwargs.get("filename", "")
             file_pct = kwargs.get("file_pct", -1)
+            if idx == 0 and file_pct < 0:
+                # Pre-file phase (model load/download; file_started always has
+                # idx >= 1) \u2014 "Transcribing 0/N: loading model..." reads like a
+                # stall, so name the phase instead.
+                self.title(f"Loading model\u2026 \u2014 {APP_TITLE}")
+                self._taskbar.set_state(TaskbarProgress.TBPF_NORMAL)
+                self._update_banner("running", "Loading model\u2026")
+                self._hide_idle_panel()
+                self._apply_panel_ratio(0.40)
+                return
             pct_str = f" \u00b7 {file_pct:.0f}%" if file_pct >= 0 else ""
+            filename = bidi_name(filename)  # Hebrew names + digits scramble without an RTL base
             self.title(f"[{idx}/{total}{pct_str}] {filename} \u2014 {APP_TITLE}")
             self._taskbar.set_state(TaskbarProgress.TBPF_NORMAL)
             if total > 0:
@@ -1900,14 +2266,30 @@ class TranscriberApp(tk.Tk):
             # Banner: show running state with file info
             banner_text = f"Transcribing {idx}/{total}: {filename}" + (f" ({file_pct:.0f}%)" if file_pct >= 0 else "")
             self._update_banner("running", banner_text)
-            # Hide idle panel if visible; shift panels to favor run details (#7)
+            # Hide idle panel if visible; shift panels to favor run details
             self._hide_idle_panel()
-            self._set_panel_ratio(0.40)
+            self._apply_panel_ratio(0.40)
         elif state == "complete":
             done = kwargs.get("done", 0)
             failed = kwargs.get("failed", 0)
             wall = kwargs.get("wall_seconds", 0.0)
             wall_str = format_hms(wall) if wall > 0 else ""
+            if kwargs.get("cancelled") or kwargs.get("stopped"):
+                # Interrupted by the user — neutral render, never the green
+                # success banner (and not the error one: nothing went wrong).
+                word = "Cancelled" if kwargs.get("cancelled") else "Stopped"
+                title_tag = f"[{word}: {done} done]"
+                if wall_str:
+                    title_tag += f" ({wall_str})"
+                self.title(f"{title_tag} — {APP_TITLE}")
+                self._taskbar.clear()
+                banner_text = f"{word}: {done} file{'s' if done != 1 else ''} done"
+                if failed > 0:
+                    banner_text += f", {failed} failed"
+                self._update_banner("paused", banner_text)
+                self._notify_completion(kwargs.get("message", "Transcription complete."))
+                self._apply_panel_ratio(0.50)
+                return
             if failed > 0:
                 title_tag = f"[Done: {done}, {failed} failed]"
             else:
@@ -1930,7 +2312,25 @@ class TranscriberApp(tk.Tk):
                     banner_text += f" in {wall_str}"
                 self._update_banner("complete", banner_text)
             self._notify_completion(kwargs.get("message", "Transcription complete."))
-            self._set_panel_ratio(0.50)  # #7: balanced on completion
+            self._apply_panel_ratio(0.50)  # balanced on completion
+        elif state == "failed":
+            # Fatal run failure (setup/model error or an unexpected worker crash).
+            # Render an explicit error state — never the green success banner that
+            # the 'complete' path shows when failed == 0.
+            message = kwargs.get("message", "Run failed.")
+            wall = kwargs.get("wall_seconds", 0.0)
+            wall_str = format_hms(wall) if wall > 0 else ""
+            title_tag = "[Failed]" + (f" ({wall_str})" if wall_str else "")
+            self.title(f"{title_tag} — {APP_TITLE}")
+            self._taskbar.set_state(TaskbarProgress.TBPF_ERROR)
+            banner_text = "Run failed — see the log for details"
+            if wall_str:
+                banner_text += f" ({wall_str})"
+            self._update_banner("error", banner_text)
+            # First line only: the message may carry a full traceback (already
+            # in the raw log), which must not be pushed into an OS notification.
+            self._notify_completion(message.split("\n", 1)[0].strip() or "Run failed.")
+            self._apply_panel_ratio(0.50)
         else:  # idle
             self.title(APP_TITLE)
             self._taskbar.clear()
@@ -1957,9 +2357,13 @@ class TranscriberApp(tk.Tk):
         if _sys.platform == "win32":
             try:
                 import ctypes
-                ctypes.windll.user32.FlashWindow(
-                    ctypes.windll.kernel32.GetConsoleWindow(), True
-                )
+                # Flash the app's taskbar button. GetConsoleWindow() is NULL in
+                # the windowed build (pythonw / PyInstaller windowed exe); the
+                # app HWND comes from GetParent(winfo_id()), same as
+                # TaskbarProgress in widgets.py.
+                hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+                if hwnd:
+                    ctypes.windll.user32.FlashWindow(hwnd, True)
                 import winsound
                 winsound.MessageBeep(winsound.MB_ICONASTERISK)
             except Exception:
@@ -2012,7 +2416,14 @@ class TranscriberApp(tk.Tk):
     def _setup_dnd(self, target: tk.Widget) -> None:
         """Try to enable native drag-and-drop. Logs install hint if tkinterdnd2 is absent."""
         try:
-            import tkinterdnd2  # noqa: F401
+            import tkinterdnd2
+            # TranscriberApp subclasses tk.Tk, so the tkdnd Tcl package is never
+            # auto-loaded (that only happens for a TkinterDnD.Tk root). Load it
+            # explicitly once — otherwise drop_target_register raises TclError on
+            # every platform and drag-and-drop silently does nothing.
+            if not getattr(self, "_tkdnd_loaded", False):
+                tkinterdnd2.TkinterDnD._require(self)
+                self._tkdnd_loaded = True
             target.drop_target_register("DND_Files")  # type: ignore[attr-defined]
             target.dnd_bind("<<Drop>>", self._on_dnd_drop)  # type: ignore[attr-defined]
             logger.debug("Drag-and-drop enabled via tkinterdnd2")
@@ -2072,6 +2483,14 @@ class TranscriberApp(tk.Tk):
             move_state = "normal" if has_queued else "disabled"
             for label in ("Move to top", "Move up", "Move down", "Move to bottom"):
                 self._tree_menu.entryconfig(label, state=move_state)
+            # Enable "Retry failed" only when failed/cancelled rows exist anywhere
+            retryable = any(
+                self.file_tree.exists(iid)
+                and self.file_tree.item(iid, "values")[1] in ("Failed", "Cancelled")
+                for iid in self.file_items.values()
+            )
+            self._tree_menu.entryconfig("Retry failed",
+                                        state="normal" if retryable else "disabled")
             self._tree_menu.tk_popup(event.x_root, event.y_root)
 
     def _show_file_error(self) -> None:
@@ -2123,16 +2542,16 @@ class TranscriberApp(tk.Tk):
         self._hover_row_id = None
 
     def _retry_failed(self) -> None:
-        """Re-queue all files with 'Failed' status and re-run transcription."""
+        """Re-queue all 'Failed' or 'Cancelled' files and re-run transcription."""
         failed_paths = []
         for path_str, item_id in self.file_items.items():
             if not self.file_tree.exists(item_id):
                 continue
             status = self.file_tree.item(item_id, "values")[1]
-            if status == "Failed":
+            if status in ("Failed", "Cancelled"):
                 failed_paths.append(path_str)
         if not failed_paths:
-            messagebox.showinfo("Nothing to retry", "No failed files in the queue.")
+            messagebox.showinfo("Nothing to retry", "No failed or cancelled files in the queue.")
             return
         # Reset failed files to Queued — next_file() will pick them up
         for path_str in failed_paths:
@@ -2144,15 +2563,18 @@ class TranscriberApp(tk.Tk):
         self.start_transcription()
 
     def _copy_file_path(self) -> None:
-        """Copy the path of the first selected file to clipboard."""
+        """Copy the path(s) of all selected files to the clipboard, one per line."""
         selected = self.file_tree.selection()
         if not selected:
             return
         item_to_path = {v: k for k, v in self.file_items.items()}
-        path_str = item_to_path.get(selected[0], "")
-        if path_str:
+        paths = [item_to_path.get(item, "") for item in selected]
+        paths = [p for p in paths if p]
+        if paths:
             self.clipboard_clear()
-            self.clipboard_append(path_str)
+            self.clipboard_append("\n".join(paths))
+            n = len(paths)
+            self.log(f"Copied {n} file path{'s' if n != 1 else ''} to clipboard.")
 
     # --- Queue reorder ---
 
@@ -2392,7 +2814,8 @@ class TranscriberApp(tk.Tk):
     def _wire_readiness_checks(self) -> None:
         """Set up traces so _check_readiness fires whenever relevant state changes."""
         for var in (self.backend_var, self.model_var, self.output_dir_var,
-                    self.beam_size_var, self.batch_size_var):
+                    self.beam_size_var, self.batch_size_var,
+                    self.diarize_var, self.num_speakers_var):
             var.trace_add("write", lambda *_: self._check_readiness())
         for fmt_var in self.format_vars.values():
             fmt_var.trace_add("write", lambda *_: self._check_readiness())
@@ -2420,7 +2843,8 @@ class TranscriberApp(tk.Tk):
 
         beam_text = self.beam_size_var.get()
         try:
-            int(beam_text)
+            if int(beam_text) < 1:
+                issues.append("Beam size must be >= 1")
         except (ValueError, TypeError):
             issues.append("Beam size must be an integer")
 
@@ -2432,8 +2856,26 @@ class TranscriberApp(tk.Tk):
         except (ValueError, TypeError):
             issues.append("Batch size must be an integer")
 
+        # Belt-and-braces: the checkbox is hidden and forced off when the
+        # engine is absent, so this only fires on programmatic mutation.
+        if self.diarize_var.get() and not _HAS_PYANNOTE:
+            issues.append("Speaker identification requires pyannote.audio "
+                          "(not installed)")
+        try:
+            if int(self.num_speakers_var.get()) < 0:
+                issues.append("Number of speakers must be >= 0")
+        except (ValueError, TypeError):
+            issues.append("Number of speakers must be an integer")
+
         if issues:
-            self.readiness_var.set(" | ".join(issues))
+            self.readiness_var.set(" · ".join(issues))
+            # Missing prerequisites are neutral guidance; only genuinely
+            # invalid input (unparseable/out-of-range values) earns red.
+            neutral = {"No audio files added", "No model selected",
+                       "No output folder", "No output format selected"}
+            invalid = [i for i in issues if i not in neutral]
+            self.readiness_label.configure(
+                foreground=C.STATUS_ERROR_FG if invalid else C.TEXT_TERTIARY)
             self._set_button_enabled(self.start_button, False)
         else:
             self.readiness_var.set("")
@@ -2541,15 +2983,6 @@ class TranscriberApp(tk.Tk):
         else:
             self.model_var.set("")
 
-        # Filter visible cards by language (#2): show matching + multilingual
-        if lang and not self.show_all_models_var.get():
-            visible = [(lbl, src) for lbl, src in entries
-                       if model_lang(lbl) in (lang, None)]
-            hidden_count = len(entries) - len(visible)
-        else:
-            visible = entries
-            hidden_count = 0
-
         logger.debug("Model list refreshed for backend: %s", backend)
 
     def _parse_model_label(self, label: str) -> tuple:
@@ -2592,9 +3025,12 @@ class TranscriberApp(tk.Tk):
 
 
     def add_files(self) -> None:
+        # Build the filter straight from AUDIO_EXTENSIONS so it can never drift
+        # out of sync (previously it omitted .opus and .aiff).
+        audio_patterns = " ".join(f"*{ext}" for ext in sorted(AUDIO_EXTENSIONS))
         files = filedialog.askopenfilenames(
             title="Select audio files",
-            filetypes=[("Audio/video", "*.mp3 *.wav *.m4a *.mp4 *.mpeg *.mpga *.webm *.ogg *.flac *.aac *.wma *.mkv"), ("All files", "*.*")],
+            filetypes=[("Audio/video", audio_patterns), ("All files", "*.*")],
         )
         if files:
             self._append_files(list(files))
@@ -2608,9 +3044,24 @@ class TranscriberApp(tk.Tk):
         for child in p.rglob("*"):
             if child.is_file() and child.suffix.lower() in AUDIO_EXTENSIONS:
                 found.append(str(child))
+        if not found:
+            # Before the first run the log pane isn't visible yet, so a
+            # log-only notice would be invisible.
+            messagebox.showinfo(
+                "No files added",
+                f"No supported audio files were found in:\n{folder}",
+                parent=self)
+            return
         self._append_files(sorted(found))
 
     def _append_files(self, new_files: List[str]) -> None:
+        # Adding while a run is active corrupts the batch accounting: idx/
+        # total and the progress maxima are frozen at start ("Transcribing
+        # 4/3"). Guards every entry path, including drag-and-drop.
+        if self.worker_thread and self.worker_thread.is_alive():
+            self.log("Cannot add files while transcription is running.")
+            self.bell()
+            return
         was_empty = len(self.file_paths) == 0
         existing = set(self.file_paths)
         added = 0
@@ -2626,12 +3077,20 @@ class TranscriberApp(tk.Tk):
                 self.file_paths.append(f)
                 existing.add(f)
                 added += 1
+        if new_files and added == 0:
+            # Everything was a duplicate — say so visibly (the log pane may
+            # not be shown yet, see add_folder).
+            if len(new_files) == 1:
+                dup_msg = "That file is already in the queue."
+            else:
+                dup_msg = f"All {len(new_files)} selected files are already in the queue."
+            messagebox.showinfo("No files added", dup_msg, parent=self)
         self.refresh_file_tree()
         self.update_overall_summary()
         self._update_contextual_banner()
         self._update_queue_button_state()
         self.log(f"Added {added} file(s).")
-        # #12: Auto-fill output folder from first file's parent directory
+        # Auto-fill output folder from first file's parent directory
         if was_empty and self.file_paths and not self.output_dir_var.get().strip():
             first_parent = str(Path(self.file_paths[0]).parent)
             self.output_dir_var.set(first_parent)
@@ -2663,6 +3122,52 @@ class TranscriberApp(tk.Tk):
             return "cancelled"
         return "queued"
 
+    def _tree_file_display(self, name: str) -> str:
+        """Elide a filename to the File column and give RTL names a proper
+        bidi base — Treeview hard-clips mid-glyph and scrambles mixed
+        Hebrew/digits/extension names otherwise. Display-only."""
+        return bidi_name(self._elide_middle(name))
+
+    def _elide_middle(self, name: str) -> str:
+        """Middle-ellipsize a filename to fit the current File column width."""
+        try:
+            width = int(self.file_tree.column("file", "width")) - self._s(14)
+            if width <= 40:
+                return name
+            if not hasattr(self, "_tree_font"):
+                import tkinter.font as tkfont
+                self._tree_font = tkfont.Font(font=(SYSTEM_FONT, _fs(10)))
+            f = self._tree_font
+            if f.measure(name) <= width:
+                return name
+            # Keep the extension plus the stem's last characters so the
+            # ellipsis never lands mid-number ("wav.8…." reads as garbage).
+            stem, dot, ext = name.rpartition(".")
+            if dot and stem and 0 < len(ext) <= 5:
+                tail = stem[-4:] + "." + ext
+            else:
+                tail = name[-8:]
+            head = name[:len(name) - len(tail)]
+            while head and f.measure(head + "…" + tail) > width:
+                head = head[:-1]
+            return head + "…" + tail
+        except Exception:
+            return name
+
+    def _reelide_tree_names(self) -> None:
+        """Recompute File-column display names after a resize."""
+        try:
+            for path_str, item_id in self.file_items.items():
+                if not self.file_tree.exists(item_id):
+                    continue
+                vals = list(self.file_tree.item(item_id, "values"))
+                disp = self._tree_file_display(Path(path_str).name)
+                if len(vals) >= 5 and vals[4] != disp:
+                    vals[4] = disp
+                    self.file_tree.item(item_id, values=tuple(vals))
+        except Exception:
+            logger.debug("Tree name re-elision failed", exc_info=True)
+
     def refresh_file_tree(self) -> None:
         current_rows = {path: self.file_tree.item(item_id, "values") for path, item_id in self.file_items.items() if self.file_tree.exists(item_id)}
         # Preserve progress data across refresh (keyed by path)
@@ -2674,6 +3179,7 @@ class TranscriberApp(tk.Tk):
         for item in self.file_tree.get_children():
             self.file_tree.delete(item)
         self.file_items = {}
+        new_status: Dict[str, str] = {}
         for idx, path_str in enumerate(self.file_paths):
             p = Path(path_str)
             previous = current_rows.get(path_str)
@@ -2686,14 +3192,18 @@ class TranscriberApp(tk.Tk):
                 status, progress = "Queued", ""
                 duration_str = format_hms(self.file_durations.get(path_str))
             tag = self._status_tag(status)
-            # #13: alternating row stripe
+            # alternating row stripe
             tags = (tag, "stripe") if idx % 2 == 1 else (tag,)
             ordinal = idx + 1
-            item_id = self.file_tree.insert("", "end", values=(ordinal, status, progress, duration_str, p.name, str(p)), tags=tags)
+            item_id = self.file_tree.insert("", "end", values=(ordinal, status, progress, duration_str, self._tree_file_display(p.name), str(p)), tags=tags)
             self.file_items[path_str] = item_id
+            new_status[path_str] = status
             # Restore progress data
             if path_str in old_progress:
                 self._tree_progress[item_id] = old_progress[path_str]
+        with self._queue_lock:
+            self.file_status.clear()
+            self.file_status.update(new_status)
         self._update_empty_state()
         self._redraw_tree_progress()
 
@@ -2712,7 +3222,9 @@ class TranscriberApp(tk.Tk):
             values[3] = duration_text
         tag = self._status_tag(values[1])
         self.file_tree.item(item_id, values=tuple(values), tags=(tag,))
-        # #10: Track progress percent for canvas bar overlay
+        with self._queue_lock:
+            self.file_status[path_str] = values[1]
+        # Track progress percent for canvas bar overlay
         if progress_pct is not None:
             self._tree_progress[item_id] = (progress_pct, values[1])
         elif status and status.lower() == "done":
@@ -2722,7 +3234,7 @@ class TranscriberApp(tk.Tk):
         self._redraw_tree_progress()
 
     def _redraw_tree_progress(self) -> None:
-        """Redraw progress bar widgets for all visible treeview rows (#10).
+        """Redraw progress bar widgets for all visible treeview rows.
 
         Places a thin tk.Frame at the bottom of each row's "progress" column cell.
         Color: blue for running, green for done.
@@ -2810,6 +3322,18 @@ class TranscriberApp(tk.Tk):
         # but guard against programmatic calls.
         if self.worker_thread and self.worker_thread.is_alive():
             return
+        # Clearing is a full session reset (queue + activity log + stats), which
+        # is broader than the button label implies — confirm when run history
+        # would be lost. Not gated on _log_entries: adding files already logs,
+        # so that would make the confirm fire on every click.
+        counts = self._count_by_status()
+        if (self._session_run_count > 0 or counts["Done"] > 0
+                or counts["Failed"] > 0 or counts["Cancelled"] > 0):
+            if not messagebox.askyesno(
+                    "Clear session",
+                    "Clear the file list and this session's activity log and statistics?",
+                    parent=self):
+                return
         self.file_paths = []
         self.file_errors.clear()
         self.file_durations.clear()
@@ -2826,6 +3350,12 @@ class TranscriberApp(tk.Tk):
         if hasattr(self, "_activity_tree"):
             self._activity_tree.delete(*self._activity_tree.get_children())
         self.log_text.delete("1.0", "end")
+        # Revert the right pane to the onboarding idle panel — the run details
+        # describe a session that no longer exists. Leave the recording
+        # panel alone if it is the one currently shown.
+        if self._run_details_frame.winfo_manager():
+            self._run_details_frame.pack_forget()
+            self._show_idle_panel()
         self.refresh_file_tree()
         self.update_overall_summary()
         self._update_contextual_banner()
@@ -2835,22 +3365,27 @@ class TranscriberApp(tk.Tk):
     def update_overall_summary(self, done: int = -1, failed: int = -1, running: int = -1) -> None:
         total = len(self.file_paths)
         self._check_readiness()
-        self._update_statusbar_file_info()  # #12
+        self._update_statusbar_file_info()
         if total == 0:
             self.overall_summary_var.set("0 files queued")
             return
         # If caller didn't provide counts, scan the tree for truth
+        cancelled = 0
         if done < 0 or failed < 0 or running < 0:
             counts = self._count_by_status()
             done = counts["Done"]
             failed = counts["Failed"]
             running = counts["Running"]
-        queued = total - done - failed - running
+            cancelled = counts["Cancelled"]
+        queued = max(0, total - done - failed - running - cancelled)
         dur_str = self._batch_duration_str()
         size_str = self._estimate_output_size_str()
         extra_parts = [x for x in (dur_str, size_str) if x]
         extra = f"  ({', '.join(extra_parts)})" if extra_parts else ""
-        self.overall_summary_var.set(f"Queued: {queued} | Done: {done} | Failed: {failed} | Running: {running}{extra}")
+        summary = f"Queued: {queued} | Done: {done} | Failed: {failed} | Running: {running}"
+        if cancelled > 0:
+            summary += f" | Cancelled: {cancelled}"
+        self.overall_summary_var.set(summary + extra)
 
     def _batch_duration_str(self) -> str:
         """Return total audio duration of queued files as a formatted string, or '' if unknown."""
@@ -2904,11 +3439,20 @@ class TranscriberApp(tk.Tk):
             beam_size = int(self.beam_size_var.get())
         except ValueError:
             raise ValueError("Beam size must be an integer.")
+        if beam_size < 1:
+            raise ValueError("Beam size must be >= 1.")
 
         try:
             batch_size = int(self.batch_size_var.get())
         except ValueError:
             raise ValueError("Batch size must be an integer.")
+
+        try:
+            num_speakers = int(self.num_speakers_var.get())
+        except ValueError:
+            raise ValueError("Number of speakers must be an integer.")
+        if num_speakers < 0:
+            raise ValueError("Number of speakers must be >= 0.")
 
         return RunOptions(
             backend=self.backend_var.get(),
@@ -2923,11 +3467,17 @@ class TranscriberApp(tk.Tk):
             condition_on_previous_text=self.condition_on_previous_text_var.get(),
             batch_size=batch_size,
             formats=selected_formats,
+            diarize=self.diarize_var.get(),
+            num_speakers=num_speakers,
+            diarize_device=self.diarize_device_var.get().strip(),
         )
 
     def validate_before_run(self) -> Optional[RunOptions]:
         if self.worker_thread and self.worker_thread.is_alive():
             messagebox.showinfo("Already running", "A transcription job is already running.")
+            return None
+        if self._recorder is not None and self._recorder.is_recording():
+            messagebox.showinfo("Recording active", "Stop the live recording first.")
             return None
 
         # Re-run readiness check (defensive — button should already be disabled if issues exist)
@@ -2954,7 +3504,7 @@ class TranscriberApp(tk.Tk):
         return opts
 
     def _show_run_controls(self) -> None:
-        """Show Pause/Resume/Stop buttons and Cancel (separated, #2)."""
+        """Show Pause/Resume/Stop buttons and Cancel (separated)."""
         if not self._run_controls.winfo_manager():
             self._run_controls.pack(side="left", padx=(16, 0))
         if not self.cancel_button.winfo_manager():
@@ -2968,7 +3518,7 @@ class TranscriberApp(tk.Tk):
             self.cancel_button.pack_forget()
 
     def _show_done_controls(self, has_failures: bool = False) -> None:
-        """Show post-completion controls (#6)."""
+        """Show post-completion controls."""
         if has_failures and not self._done_controls.winfo_manager():
             self._done_controls.pack(side="left", padx=(16, 0))
         elif not has_failures and self._done_controls.winfo_manager():
@@ -2988,9 +3538,20 @@ class TranscriberApp(tk.Tk):
             self._set_button_enabled(self.stop_button, True)
             self._set_button_enabled(self.cancel_button, True)
             self._set_button_enabled(self.start_button, False)
+            if self.record_button:
+                self._set_button_enabled(self.record_button, False)
             self.start_button.config(text="  Start transcription  ")
             self.readiness_var.set("")
             self._update_queue_button_state()
+            # _update_queue_button_state derives is_running from the worker
+            # thread, which hasn't started yet when this runs — disable Clear
+            # explicitly so it isn't left enabled-looking during the run.
+            self._set_button_enabled(self._btn_clear, False)
+            # Adding files mid-run is blocked (_append_files guard); grey the
+            # buttons so the affordance matches. Drag-and-drop hits the same
+            # guard.
+            self._set_button_enabled(self._btn_add_files, False)
+            self._set_button_enabled(self._btn_add_folder, False)
         else:
             self._hide_run_controls()
             self._stop_pause_blink()
@@ -3001,14 +3562,38 @@ class TranscriberApp(tk.Tk):
             has_failures = bool(self.file_errors)
             self._show_done_controls(has_failures)
             self._check_readiness()  # re-evaluate and set start button state
-            # Let contextual banner set button text based on queue state
-            self._update_contextual_banner()
+            if self.record_button:
+                self._set_button_enabled(self.record_button, True)
+            self._set_button_enabled(self._btn_add_files, True)
+            self._set_button_enabled(self._btn_add_folder, True)
+            # Let contextual banner set button text based on queue state.
+            # worker_finished: this branch only runs from the done/failed/
+            # fatal_error handlers, where the thread may still be tearing down.
+            self._update_contextual_banner(worker_finished=True)
             self._update_queue_button_state()
+
+    def _requeue_cancelled(self) -> None:
+        """Reset any 'Cancelled' rows back to 'Queued' so they can be re-run."""
+        changed = False
+        for path_str, item_id in list(self.file_items.items()):
+            if not self.file_tree.exists(item_id):
+                continue
+            if self.file_tree.item(item_id, "values")[1] == "Cancelled":
+                self.set_tree_row(path_str, status="Queued", progress_text="")
+                self.file_errors.pop(path_str, None)
+                changed = True
+        if changed:
+            self.refresh_file_tree()
 
     def start_transcription(self) -> None:
         opts = self.validate_before_run()
         if not opts:
             return
+
+        # Fold any 'Cancelled' rows from a previous run back into the queue so
+        # Start re-runs them — otherwise a cancelled file is stranded (re-runnable
+        # only by Remove + re-Add) while the summary still counts it as queued.
+        self._requeue_cancelled()
 
         # Count only Queued files — don't re-process Done/Failed
         counts = self._count_by_status()
@@ -3257,37 +3842,199 @@ class TranscriberApp(tk.Tk):
             self.check_for_cancel()
             self.post_event("paused")
             time.sleep(0.15)
+        # Mirror worker.wait_if_paused: a cancel issued while paused wins
+        # over the resume.
+        self.check_for_cancel()
         self.post_event("resumed")
 
     def post_event(self, kind: str, **payload) -> None:
         self.event_queue.put((kind, payload))
 
+    # ------------------------------------------------------------------
+    # Live recording
+    # ------------------------------------------------------------------
+
+    def _update_recording_visibility(self) -> None:
+        """Show or hide the Record button and recording panel based on the experimental toggle."""
+        enabled = self._experimental_recording_var.get()
+        if enabled:
+            # Show Record button (if deps available and not already packed)
+            if self.record_button and not self.record_button.winfo_manager():
+                self.record_button.pack(side="left", padx=(0, 8), after=self.start_button)
+        else:
+            # Stop any active recording
+            if self._recorder is not None and self._recorder.is_recording():
+                self._stop_recording()
+            # Hide recording panel if visible, restore idle panel
+            if self._recording_panel.winfo_manager():
+                self._recording_panel.pack_forget()
+                self._run_subtitle.configure(text="")
+                if not self._idle_panel.winfo_manager() and not self._run_details_frame.winfo_manager():
+                    self._idle_panel.pack(fill="both", expand=True)
+            # Hide Record button
+            if self.record_button and self.record_button.winfo_manager():
+                self.record_button.pack_forget()
+        self.save_config_from_ui()
+
+    def _toggle_recording(self) -> None:
+        """Start or stop live recording."""
+        if self._recorder is not None and self._recorder.is_recording():
+            self._stop_recording()
+        else:
+            self._start_recording()
+
+    def _start_recording(self) -> None:
+        """Begin live speech-to-text recording."""
+        # Block if batch transcription is running
+        if self.worker_thread and self.worker_thread.is_alive():
+            from tkinter import messagebox
+            messagebox.showinfo("Busy", "Cannot record while batch transcription is running.")
+            return
+
+        from hebrewscribe.recorder import LiveRecorder
+
+        # Resolve model spec from current language selection
+        model_spec = self.get_selected_model_spec()
+        if not model_spec:
+            from tkinter import messagebox
+            messagebox.showerror("No model", "Please select a language first.")
+            return
+
+        language = self.language_var.get().strip()
+        device = self.device_var.get().strip()
+        compute_type = self.compute_type_var.get().strip()
+
+        # Show recording panel
+        if self._idle_panel.winfo_manager():
+            self._idle_panel.pack_forget()
+        if self._run_details_frame.winfo_manager():
+            self._run_details_frame.pack_forget()
+        self._recording_panel.pack(fill="both", expand=True)
+        self._widen_for_recording()
+
+        # Update button appearance
+        if self.record_button:
+            self.record_button.configure(
+                text="  Stop recording  ",
+                background=self._BTN_STYLES["destructive"]["bg"],
+                foreground=self._BTN_STYLES["destructive"]["fg"],
+                activebackground=self._BTN_STYLES["destructive"]["press_bg"],
+            )
+            self.record_button._btn_colors = self._BTN_STYLES["destructive"]
+
+        # Disable start button during recording
+        self._set_button_enabled(self.start_button, False)
+
+        # Update right panel heading
+        self._run_subtitle.configure(text="Live speech-to-text")
+
+        self._rec_status_var.set("Starting...")
+
+        # Create and start recorder
+        self._recorder = LiveRecorder(
+            event_callback=self.post_event,
+            language=language,
+            model_spec=model_spec,
+            device=device,
+            compute_type=compute_type,
+        )
+        self._recorder.start()
+
+    def _stop_recording(self) -> None:
+        """Stop live recording without blocking the GUI.
+
+        recorder.stop() joins worker threads — up to ~10 s when a segment is
+        mid-transcription — so it runs off the Tk main thread. The button
+        reset and status happen in the rec_stopped handler; until then the
+        Record button stays disabled so a re-start can't race the old
+        threads.
+        """
+        recorder, self._recorder = self._recorder, None
+        if recorder is None:
+            return
+        self._rec_status_var.set("Stopping...")
+        if self.record_button:
+            self._set_button_enabled(self.record_button, False)
+        threading.Thread(target=recorder.stop, daemon=True,
+                         name="rec-stop").start()
+
+    def _copy_rec_text(self) -> None:
+        """Copy recorded text to clipboard (minus display-only RLM marks)."""
+        text = self._rec_text.get("1.0", "end-1c").replace(chr(0x200F), "").strip()
+        if text:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+
+    def _clear_rec_text(self) -> None:
+        """Clear the recorded text area (confirmed — dictation has no undo)."""
+        if self._rec_text.get("1.0", "end-1c").strip():
+            from tkinter import messagebox
+            if not messagebox.askyesno(
+                "Clear text?",
+                "Clear the dictated text? This cannot be undone.",
+                parent=self,
+            ):
+                return
+        self._rec_text.delete("1.0", "end")
+
+    def _save_rec_text(self) -> None:
+        """Save recorded text to a file (minus display-only RLM marks)."""
+        text = self._rec_text.get("1.0", "end-1c").replace(chr(0x200F), "").strip()
+        if not text:
+            return
+        from tkinter import filedialog
+        path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            title="Save recording text",
+        )
+        if path:
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(text)
+            except OSError as e:
+                from tkinter import messagebox
+                messagebox.showerror("Save failed", str(e))
+
     def next_file(self) -> Optional[str]:
         """Return the next Queued file path, or None if none remain.
 
-        Called by the worker thread. Uses _queue_lock to safely read
-        file_paths and file_tree status while the GUI thread may be
-        reordering the queue.
+        Called by the worker thread. Reads only plain-Python state
+        (file_paths + file_status) under _queue_lock — deliberately no Tk
+        calls: a Treeview read from this thread could hit a mid-rebuild
+        tree (TclError aborts the batch) or deadlock against a GUI thread
+        blocked on the same lock.
         """
         with self._queue_lock:
             for path_str in self.file_paths:
-                item_id = self.file_items.get(path_str)
-                if not item_id or not self.file_tree.exists(item_id):
-                    continue
-                status = self.file_tree.item(item_id, "values")[1]
-                if status == "Queued":
+                if self.file_status.get(path_str, "Queued") == "Queued":
                     return path_str
             return None
 
     def _ensure_determinate_progress(self) -> None:
         """Switch current-file bar back to determinate if it's pulsing."""
         if str(self.current_progress.cget("mode")) == "indeterminate":
+            self._cancel_progress_anim(self.current_progress)
             self.current_progress.stop()
             self.current_progress.config(mode="determinate", maximum=100, value=0)
+
+    def _cancel_progress_anim(self, bar: ttk.Progressbar) -> None:
+        """Cancel every pending animation frame scheduled for this bar."""
+        anim_key = f"_anim_{id(bar)}"
+        for aid in getattr(self, anim_key, ()):
+            try:
+                self.after_cancel(aid)
+            except Exception:
+                pass
+        setattr(self, anim_key, [])
 
     def _smooth_set_progress(self, bar: ttk.Progressbar, target: float,
                              steps: int = 6, interval: int = 30) -> None:
         """Animate a progress bar from its current value to target over steps frames."""
+        # Cancel ALL pending frames of the previous animation — keeping only
+        # the last after-id let stale frames land after a newer value and
+        # drag the bar backward.
+        self._cancel_progress_anim(bar)
         try:
             current = float(bar["value"])
         except (tk.TclError, ValueError):
@@ -3295,16 +4042,13 @@ class TranscriberApp(tk.Tk):
         if abs(target - current) < 0.5:
             bar["value"] = target
             return
-        # Cancel any pending animation on this bar
         anim_key = f"_anim_{id(bar)}"
-        prev = getattr(self, anim_key, None)
-        if prev:
-            self.after_cancel(prev)
         delta = target - current
+        ids = []
         for i in range(1, steps + 1):
             val = current + delta * (i / steps)
-            aid = self.after(i * interval, lambda v=val: bar.configure(value=v))
-        setattr(self, anim_key, aid)
+            ids.append(self.after(i * interval, lambda v=val: bar.configure(value=v)))
+        setattr(self, anim_key, ids)
 
     # --- Breathing line compose & refresh ---
 
@@ -3530,9 +4274,13 @@ class TranscriberApp(tk.Tk):
         wall_elapsed = time.time() - self._batch_wall_start
         # Include both completed files and the in-progress file's contribution
         audio_done = self._batch_audio_done + getattr(self, "_batch_audio_done_current", 0.0)
-        if wall_elapsed <= 0 or audio_done <= 0:
+        # Warm-up gate: during model load, wall time grows while audio_done
+        # stays ~0, so the speed sample explodes into absurd estimates
+        # ("~57424:19:04"). Publish nothing until the sample is trustworthy.
+        if wall_elapsed < 10.0 or audio_done < 3.0:
             self._last_batch_speed = None
             self._last_batch_eta_s = None
+            self._clear_queued_estimates()
             return
         batch_speed = audio_done / wall_elapsed  # audio-sec per wall-sec
         self._last_batch_speed = batch_speed
@@ -3543,6 +4291,15 @@ class TranscriberApp(tk.Tk):
             self._last_batch_eta_s = None
         # Update per-file estimates for queued files
         self._update_queued_estimates(batch_speed)
+
+    def _clear_queued_estimates(self) -> None:
+        """Blank any stale estimate text on still-queued rows."""
+        for path_str, item_id in self.file_items.items():
+            if not self.file_tree.exists(item_id):
+                continue
+            values = self.file_tree.item(item_id, "values")
+            if values[1] == "Queued" and values[2]:
+                self.set_tree_row(path_str, progress_text="")
 
     def _update_queued_estimates(self, batch_speed: float) -> None:
         """Show estimated processing time on queued rows based on current batch speed."""
@@ -3557,7 +4314,12 @@ class TranscriberApp(tk.Tk):
             dur = self.file_durations.get(path_str)
             if dur and dur > 0:
                 est_wall = dur / batch_speed
-                self.set_tree_row(path_str, progress_text=f"~{format_hms(est_wall)} est.")
+                # Sanity cap: a wrong number destroys trust — blank is better.
+                if est_wall > 8 * 3600:
+                    if values[2]:
+                        self.set_tree_row(path_str, progress_text="")
+                    continue
+                self.set_tree_row(path_str, progress_text=f"~{format_hms(est_wall)}")
 
     def _build_completion_stats(self, wall_seconds: float, done: int, failed: int) -> str:
         """Build a one-line stats summary after batch completion.
@@ -3609,7 +4371,9 @@ class TranscriberApp(tk.Tk):
     def _handle_event(self, kind: str, payload: dict) -> None:
         """Process a single worker event. Exceptions are caught by the caller."""
         if kind == "log":
-            self.log(payload["message"])  # phase auto-classified by _classify_log_phase
+            # phase auto-classified by _classify_log_phase; workers may pass
+            # an explicit level (e.g. diarization warnings)
+            self.log(payload["message"], level=payload.get("level", "info"))
         elif kind == "file_duration":
             path_str = payload["path"]
             dur = payload["duration"]
@@ -3641,12 +4405,15 @@ class TranscriberApp(tk.Tk):
                 phase_desc = desc if desc.lower().startswith("download") else f"Downloading {desc}"
                 self.current_phase_var.set(
                     f"{phase_desc}  ({mb_done:.0f} / {mb_total:.0f} MB)")
-                # Show download progress in status bar
-                self._statusbar_left.config(
-                    text=f"Downloading model: {pct:.0f}% ({mb_done:.0f}/{mb_total:.0f} MB)")
+                # Show download progress in status bar. The label is bound to
+                # device_info_var via textvariable, which overrides any direct
+                # .config(text=...); drive the var so the line actually appears.
+                self.device_info_var.set(
+                    f"Downloading model: {pct:.0f}% ({mb_done:.0f}/{mb_total:.0f} MB)")
             self._refresh_breathing_lines()
         elif kind == "download_done":
             self._ensure_determinate_progress()
+            self._cancel_progress_anim(self.current_progress)
             self.current_progress["value"] = 100
             self.current_phase_var.set("Download complete. Loading model\u2026")
             self.job_status_var.set("Loading model\u2026")
@@ -3701,7 +4468,10 @@ class TranscriberApp(tk.Tk):
             self._refresh_breathing_lines()
         elif kind == "overall_progress":
             self._smooth_set_progress(self.overall_progress, float(payload.get("value", 0)))
-            self.update_overall_summary(done=payload.get("done", 0), failed=payload.get("failed", 0), running=payload.get("running", 0))
+            # No args: rescan the tree for truth. The worker's payload counts
+            # are per-run, so on Continue/retry runs they mixed with the
+            # whole-session totals shown everywhere else.
+            self.update_overall_summary()
         elif kind == "file_started":
             self._ensure_determinate_progress()
             path_str = payload["path"]
@@ -3713,6 +4483,7 @@ class TranscriberApp(tk.Tk):
             self.set_tree_row(path_str, status="Running", progress_text="0%", progress_pct=0.0)
             self.current_file_var.set(payload["name"])
             self.current_phase_var.set(payload.get("phase", "Starting"))
+            self._cancel_progress_anim(self.current_progress)
             self.current_progress["value"] = 0
             self._current_file_pct = 0.0
             self._current_file_idx = payload.get("idx", 0)
@@ -3738,11 +4509,23 @@ class TranscriberApp(tk.Tk):
             text = payload.get("text", "").strip()
             if text:
                 tag = self._get_preview_text_tag()
-                self.preview_text.insert("end", text + "\n", tag)
+                self.preview_text.insert(
+                    "end", self._bidi_display(text, tag == "rtl") + "\n", tag)
                 self.preview_text.see("end")
                 # Update segment & word counters (shown in tooltip)
                 self._segments_done += 1
                 self._words_transcribed += len(text.split())
+        elif kind == "preview_replace":
+            # Post-diarization refresh: swap the streamed transcript for the
+            # final speaker-labeled text of the current file. Display-only —
+            # the segment/word counters keep their transcription-time values.
+            text = payload.get("text", "").strip()
+            if text:
+                tag = self._get_preview_text_tag()
+                self.preview_text.delete("1.0", "end")
+                self.preview_text.insert(
+                    "end", self._bidi_display(text, tag == "rtl") + "\n", tag)
+                self.preview_text.see("end")
         elif kind == "file_finished":
             path_str = payload["path"]
             self._last_finished_file_path = path_str
@@ -3752,6 +4535,7 @@ class TranscriberApp(tk.Tk):
             file_wall = time.time() - self._file_wall_starts.get(path_str, time.time())
             elapsed_str = format_hms(file_wall) if file_wall > 0 else "Done"
             self.set_tree_row(path_str, status="Done", progress_text=elapsed_str, progress_pct=100.0)
+            self._cancel_progress_anim(self.current_progress)
             self.current_progress["value"] = 100
             self._current_file_pct = 100.0
             language = payload.get("language")
@@ -3793,6 +4577,10 @@ class TranscriberApp(tk.Tk):
             self._log_current_phase = "results"
             self._log_current_file = None
             self._ensure_determinate_progress()
+            # Restore the status-bar device line in case a download_progress
+            # overwrote it and the run ended before download_done (e.g. a
+            # cancelled weights download) — mirrors the failed/fatal handlers.
+            self._detect_device_info()
             self._stop_elapsed_ticker()
             self._stop_vram_ticker()
             self._current_file_path = None
@@ -3820,11 +4608,14 @@ class TranscriberApp(tk.Tk):
             else:
                 self.current_phase_var.set("Finished")
             self._refresh_breathing_lines()
+            self.update_overall_summary()
             self._apply_app_state("complete",
                                   message=msg,
                                   done=done_n,
                                   failed=failed_n,
-                                  wall_seconds=wall_seconds)
+                                  wall_seconds=wall_seconds,
+                                  cancelled=payload.get("cancelled", False),
+                                  stopped=payload.get("stopped", False))
             # Activity tree: results node (summary already in the tree label)
             self._activity_on_results(
                 wall_seconds, done_n, failed_n,
@@ -3845,11 +4636,94 @@ class TranscriberApp(tk.Tk):
             self.current_phase_var.set("Failed")
             self._last_job_wall = wall_seconds
             self._refresh_breathing_lines()
-            self._apply_app_state("complete", message="Failed", done=0, failed=0, wall_seconds=wall_seconds)
+            self.update_overall_summary()
+            # A failure mid-download leaves "Downloading model: N%" in the
+            # status bar (only download_done restores it) — re-detect now.
+            self._detect_device_info()
+            self._apply_app_state("failed",
+                                  message=f"Transcription failed: {payload['message']}",
+                                  wall_seconds=wall_seconds)
             # Auto-switch to log tab on fatal failure, show raw view for traceback
             self._detail_notebook.select(1)
             self._switch_log_view("raw")
             self.log(f"Transcription failed: {payload['message']}")
+        elif kind == "fatal_error":
+            # The worker thread crashed with an unhandled exception. Without this
+            # branch the event is silently dropped: controls stay in the running
+            # state forever and the sleep inhibitor is never released. Recover the
+            # UI exactly like a fatal 'failed' run.
+            self._ensure_determinate_progress()
+            self._stop_elapsed_ticker()
+            self._stop_vram_ticker()
+            self._current_file_path = None
+            self.set_controls_running(False)
+            wall_seconds = time.time() - self._job_wall_start if self._job_wall_start else 0.0
+            self.job_status_var.set("Failed.")
+            self.current_phase_var.set("Failed")
+            self._last_job_wall = wall_seconds
+            self._refresh_breathing_lines()
+            self.update_overall_summary()
+            self._detect_device_info()
+            msg = payload.get("message", "Unexpected internal error.")
+            self._apply_app_state("failed", message=msg, wall_seconds=wall_seconds)
+            self._detail_notebook.select(1)
+            self._switch_log_view("raw")
+            self.log(f"Fatal error: {msg}")
+
+        # --- Recording events ---
+        elif kind == "rec_text":
+            text = payload.get("text", "").strip()
+            if text:
+                lang = payload.get("language", "")
+                tag = "rtl" if lang == "he" else "ltr"
+                self._rec_text.insert(
+                    "end", self._bidi_display(text, tag == "rtl") + "\n", tag)
+                self._rec_text.see("end")
+        elif kind == "rec_status":
+            msg = payload.get("message", "")
+            # A hot microphone is capture, not success/progress — it gets a
+            # red recording dot, never green. "Recording stopped" stays
+            # neutral (no em-dash, so the prefix check excludes it).
+            hot = msg.startswith(("Recording —", "Transcribing",
+                                  "Preparing model"))
+            self._rec_status_var.set(("● " + msg) if hot else msg)
+            if "error" in msg.lower() or "failed" in msg.lower():
+                self._rec_status_label.configure(foreground=self.CLR_ERROR_FG)
+            elif hot:
+                self._rec_status_label.configure(foreground=C.BTN_DESTRUCTIVE_FG)
+            else:
+                self._rec_status_label.configure(foreground=C.TEXT_SECONDARY)
+        elif kind == "rec_error":
+            msg = payload.get("message", "Unknown error")
+            self._rec_status_var.set(f"Error: {msg}")
+            self._rec_status_label.configure(foreground=self.CLR_ERROR_FG)
+            logger.error("Recording error: %s", msg)
+        elif kind == "rec_level":
+            level = payload.get("level", 0.0)
+            try:
+                bar_width = max(0, int(self._rec_level_frame.winfo_width() * level))
+                self._rec_level_bar.place_configure(width=bar_width)
+            except (tk.TclError, ValueError):
+                pass
+        elif kind == "rec_stopped":
+            # Recording finished — reset the Record button (kept disabled by
+            # _stop_recording while the recorder threads wound down) and the
+            # status, unless an error message is showing.
+            if self.record_button:
+                colors = self._BTN_STYLES["secondary"]
+                self.record_button.configure(
+                    text="  Record  ",
+                    background=colors["bg"],
+                    foreground=colors["fg"],
+                    activebackground=colors["press_bg"],
+                )
+                self.record_button._btn_colors = colors
+                self._set_button_enabled(self.record_button, True)
+            self._check_readiness()
+            if self._rec_status_var.get() in ("Stopping...", "Starting..."):
+                self._rec_status_var.set("Recording stopped")
+                self._rec_status_label.configure(foreground=C.TEXT_SECONDARY)
+            self._rec_level_bar.place_configure(width=0)
 
     # Worker methods (run_transcription_worker, load_model, transcribe_*,
     # write_outputs, cuda_available) extracted to hebrewscribe.worker.
@@ -3881,12 +4755,16 @@ class TranscriberApp(tk.Tk):
         now = time.time()
         time_str = time.strftime("%H:%M:%S")
 
-        # Auto-detect level from content if not explicitly set
+        # Auto-detect level from content if not explicitly set. Match only the
+        # message head (text before the first colon, quoted spans removed):
+        # worker templates put filenames after a colon ("Transcribing: <name>"),
+        # and a filename that happens to contain "error"/"failed" must not turn
+        # the line red or force-expand its activity node.
         if level == "info":
-            low = message.lower()
-            if "error" in low or "failed" in low or "traceback" in low:
+            head = re.sub(r"'[^']*'", "", message).split(":", 1)[0].lower()
+            if "error" in head or "failed" in head or "traceback" in head:
                 level = "error"
-            elif "warning" in low or "warn" in low:
+            elif "warning" in head or "warn" in head:
                 level = "warning"
 
         # Auto-classify phase if not provided
@@ -4211,7 +5089,7 @@ class TranscriberApp(tk.Tk):
                         if part.startswith("models--"):
                             short = part.replace("models--", "").replace("--", "/", 1)
                             return f"{prefix}: {short}"
-                return f"{prefix}: {p.name}"
+                return f"{prefix}: {bidi_name(p.name)}"
         return msg
 
     def _activity_show_context_menu(self, event) -> None:
@@ -4332,11 +5210,16 @@ class TranscriberApp(tk.Tk):
         ok_btn.pack(pady=(18, 0))
         dlg.bind("<Escape>", lambda e: dlg.destroy())
         dlg.bind("<Return>", lambda e: dlg.destroy())
-        # Center on parent
+        # Center on parent, clamped to the screen: this dialog holds a grab,
+        # so if it landed fully off-screen the app would look frozen. min
+        # before max so the top-left corner wins when both bounds conflict.
         dlg.update_idletasks()
         x = self.winfo_x() + (self.winfo_width() - dlg.winfo_width()) // 2
         y = self.winfo_y() + (self.winfo_height() - dlg.winfo_height()) // 2
+        x = max(0, min(x, self.winfo_screenwidth() - dlg.winfo_width()))
+        y = max(0, min(y, self.winfo_screenheight() - dlg.winfo_height()))
         dlg.geometry(f"+{x}+{y}")
+        dlg.focus_set()
 
     def save_config_from_ui(self) -> None:
         self.config_data["last_output_dir"] = self.output_dir_var.get().strip()
@@ -4349,13 +5232,30 @@ class TranscriberApp(tk.Tk):
         self.config_data["last_task"] = self.task_var.get().strip()
         self.config_data["last_device"] = self.device_var.get().strip()
         self.config_data["last_compute_type"] = self.compute_type_var.get().strip()
-        self.config_data["last_beam_size"] = int(self.beam_size_var.get())
+        # A mid-edit or non-numeric entry keeps the previously saved value —
+        # this runs from tk callbacks (recording toggle, window close) where a
+        # bare int() would raise into the crash dialog.
+        try:
+            self.config_data["last_beam_size"] = int(self.beam_size_var.get())
+        except (ValueError, TypeError):
+            pass
         self.config_data["last_vad_filter"] = self.vad_var.get()
         self.config_data["last_condition_on_previous_text"] = self.condition_on_previous_text_var.get()
-        self.config_data["last_batch_size"] = int(self.batch_size_var.get())
+        try:
+            self.config_data["last_batch_size"] = int(self.batch_size_var.get())
+        except (ValueError, TypeError):
+            pass
         self.config_data["last_speed_preset"] = self.speed_preset_var.get()
         self.config_data["last_formats"] = [fmt for fmt, var in self.format_vars.items() if var.get()]
         self.config_data["prevent_sleep"] = self.prevent_sleep_var.get()
+        self.config_data["experimental_recording"] = self._experimental_recording_var.get()
+        self.config_data["last_diarize"] = self.diarize_var.get()
+        try:
+            self.config_data["last_num_speakers"] = int(
+                self.num_speakers_var.get())
+        except (ValueError, TypeError):
+            pass
+        self.config_data["diarize_device"] = self.diarize_device_var.get().strip()
         self.save_config()
 
     def save_config(self) -> None:

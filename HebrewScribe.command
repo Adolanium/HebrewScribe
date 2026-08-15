@@ -11,4 +11,9 @@ elif [ -f ".venv/bin/activate" ]; then
     source .venv/bin/activate
 fi
 
-python -m hebrewscribe
+# Stock macOS has no bare "python" — prefer it only inside an activated venv.
+if command -v python >/dev/null 2>&1; then
+    python -m hebrewscribe
+else
+    python3 -m hebrewscribe
+fi

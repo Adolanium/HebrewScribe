@@ -1,5 +1,6 @@
 """Tests for hebrewscribe.power.SleepInhibitor."""
 
+import os
 import subprocess
 import sys
 import unittest
@@ -83,7 +84,7 @@ class TestSleepInhibitorMacOS(unittest.TestCase):
         with patch("hebrewscribe.power.subprocess.Popen", return_value=mock_proc) as mock_popen:
             inhibitor._acquire_macos()
         mock_popen.assert_called_once_with(
-            ["caffeinate", "-i"],
+            ["caffeinate", "-i", "-w", str(os.getpid())],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )

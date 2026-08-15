@@ -42,7 +42,10 @@ class ToolTip:
     def _dpi_scale(self) -> float:
         """Read the DPI scale from the root window, falling back to 1.0."""
         try:
-            root = self.widget.winfo_toplevel()
+            # _root(), not winfo_toplevel(): for widgets inside a dialog the
+            # nearest toplevel is the dialog, which has no _dpi_scale — the
+            # attribute lives on the application root.
+            root = self.widget._root()
             return getattr(root, "_dpi_scale", 1.0)
         except Exception:
             return 1.0
@@ -69,13 +72,25 @@ class ToolTip:
         y = self.widget.winfo_rooty() + self.widget.winfo_height() + round(4 * scale)
         tw = tk.Toplevel(self.widget)
         tw.wm_overrideredirect(True)
-        tw.wm_geometry(f"+{x}+{y}")
         label = tk.Label(
             tw, text=resolved, justify="left", wraplength=wrap,
             background=C.TOOLTIP_BG, foreground=C.TOOLTIP_FG, relief="flat", borderwidth=0,
             font=(SYSTEM_FONT, _fs(9)), padx=round(10 * scale), pady=round(6 * scale),
         )
         label.pack()
+        # Clamp to the screen so tips near the right/bottom edges stay visible.
+        # Never slide the tip up over the cursor (the <Leave> binding would
+        # hide it and cause a show/hide flicker loop) — flip above the widget
+        # instead. Tk reports only the primary monitor's size on Windows, so
+        # on secondary monitors this clamp may not trigger; acceptable.
+        tw.update_idletasks()
+        tip_w, tip_h = tw.winfo_reqwidth(), tw.winfo_reqheight()
+        screen_w = self.widget.winfo_screenwidth()
+        screen_h = self.widget.winfo_screenheight()
+        x = max(0, min(x, screen_w - tip_w))
+        if y + tip_h > screen_h:
+            y = self.widget.winfo_rooty() - tip_h - round(4 * scale)
+        tw.wm_geometry(f"+{x}+{y}")
         self._tipwindow = tw
 
     def _hide(self) -> None:
@@ -114,8 +129,14 @@ class TaskbarProgress:
         """Pure-ctypes ITaskbarList3 via raw COM vtable — no comtypes needed."""
         import ctypes
 
+        # Little-endian GUID byte layouts (data1/2/3 byte-swapped, data4 raw):
+        # CLSID_TaskbarList  {56FDF344-FD6D-11D0-958A-006097C9A090}
+        # IID_ITaskbarList3  {EA1AFB91-9E28-4B86-90E9-9E9F8A5EEFAF}
+        # The IID previously encoded here was a wrong GUID — CoCreateInstance
+        # answered E_NOINTERFACE on every machine and taskbar progress was
+        # silently dead (fixed 2026-08-12, verified via ctypes probe).
         CLSID_TaskbarList = b"\x44\xf3\xfd\x56\x6d\xfd\xd0\x11\x95\x8a\x00\x60\x97\xc9\xa0\x90"
-        IID_ITaskbarList3 = b"\xea\x1c\x5c\xc4\x3c\x34\xd1\x4d\xb2\xd3\xff\xa6\x8f\x1c\xbf\x39"
+        IID_ITaskbarList3 = b"\x91\xfb\x1a\xea\x28\x9e\x86\x4b\x90\xe9\x9e\x9f\x8a\x5e\xef\xaf"
 
         ole32 = ctypes.windll.ole32
         ole32.CoInitialize(None)

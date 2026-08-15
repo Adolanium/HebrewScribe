@@ -225,3 +225,73 @@ class TestEdgeCases:
             "Stopped after current file. Completed: 2. Failed: 0.", "user")
         assert phase == "results"
         assert raw is False
+
+
+# ---------------------------------------------------------------------------
+# Level auto-detection in _record_log (LOG-02/08): only the message head
+# decides the level, so filenames containing "error"/"failed" stay info.
+# ---------------------------------------------------------------------------
+
+class _RecordLogHarness:
+    """Bare-minimum stand-in for TranscriberApp for _record_log."""
+
+    def __init__(self):
+        self._log_entries = []
+        self._log_run_id = 0
+        self._log_current_phase = "user"
+        self._log_current_file = None
+
+
+_RecordLogHarness._record_log = TranscriberApp._record_log
+
+
+class TestLevelAutoDetection:
+    def _level(self, message):
+        return _RecordLogHarness()._record_log(message).level
+
+    def test_error_head_detected(self):
+        assert self._level("ERROR in a.mp3: boom") == "error"
+
+    def test_failed_head_detected(self):
+        assert self._level("Transcription failed: something broke") == "error"
+
+    def test_traceback_detected(self):
+        assert self._level("Traceback (most recent call last):\n  ...") == "error"
+
+    def test_warning_head_detected(self):
+        assert self._level("Warning: ffmpeg not found") == "warning"
+
+    def test_filename_with_error_stays_info(self):
+        assert self._level("Transcribing: error_analysis.wav") == "info"
+
+    def test_filename_with_failed_stays_info(self):
+        assert self._level("Done: interview_failed_mic.mp3") == "info"
+
+    def test_renamed_output_with_error_stem_stays_info(self):
+        assert self._level("Output renamed to 'error_take2.*' to avoid collision") == "info"
+
+    def test_quoted_filename_with_colon_stays_info(self):
+        # macOS filenames may contain ':' — quoted spans are stripped before
+        # the colon split so the keyword inside the name can't leak into the head.
+        assert self._level(
+            "Output renamed to 'failed interview: part 2.*' to avoid collision") == "info"
+
+    def test_explicit_level_not_overridden(self):
+        h = _RecordLogHarness()
+        assert h._record_log("Transcribing: x.wav", level="error").level == "error"
+
+    def test_identified_speakers_is_info(self):
+        # Diarization completion line must never render as warning/error.
+        assert self._level("Identified 3 speakers") == "info"
+
+    def test_diarize_degrade_warning_level(self):
+        # The worker's degrade message: head-only matching flags "Warning"
+        # while a filename containing "error" after the colon can't escalate.
+        assert self._level(
+            "Warning: speaker identification failed — keeping the "
+            "transcript without speaker labels (error_take1.wav)") == "warning"
+
+    def test_explicit_warning_level_from_event_passthrough(self):
+        h = _RecordLogHarness()
+        assert h._record_log("speaker labels lost",
+                             level="warning").level == "warning"

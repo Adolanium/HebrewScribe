@@ -6,7 +6,7 @@ import sys
 logger = logging.getLogger("HebrewScribe")
 
 
-# --- Platform-adaptive font sizing (Phase 1.1) ---
+# --- Platform-adaptive font sizing ---
 # SF Pro (macOS) renders ~8% taller than Segoe UI (Windows) at the same pt size.
 _FONT_SIZE_OFFSET = -1 if sys.platform == "darwin" else 0
 
@@ -15,7 +15,7 @@ def _fs(base: int) -> int:
     return max(7, base + _FONT_SIZE_OFFSET)
 
 
-# --- Platform-adaptive layout (Phase 1.2) ---
+# --- Platform-adaptive layout ---
 if sys.platform == "darwin":
     PAD_CARD_INNER_X = 10
     PAD_CARD_INNER_Y = 6
@@ -27,7 +27,7 @@ else:
     PAD_TOOLBAR_GAP = 8
     PAD_SECTION_BELOW = 8
 
-# --- Platform-adaptive row height (Phase 1.3) ---
+# --- Platform-adaptive row height ---
 _BASE_ROWHEIGHT = 26 if sys.platform == "darwin" else 28
 
 
@@ -37,8 +37,7 @@ class Colors:
     All GUI colors are defined here. No hex literals should appear in app.py
     or widgets.py — use Colors.CONSTANT_NAME instead.
 
-    Brand colors are from context.md and must not be changed without
-    updating the project branding documentation.
+    Brand accent colors are fixed project branding — do not change them.
     """
 
     # --- Surface hierarchy (light to dark) ---
@@ -69,7 +68,7 @@ class Colors:
     TEXT_DISABLED = "#a0a0a0"      # truly disabled
     TEXT_PLACEHOLDER = "#c0c0c0"   # placeholder icons
 
-    # --- Brand accent (from context.md — do not change) ---
+    # --- Brand accent (fixed branding — do not change) ---
     ACCENT = "#2a5cdb"
     ACCENT_HOVER = "#4a7aef"
     ACCENT_PRESS = "#1a44b0"
@@ -81,8 +80,10 @@ class Colors:
     BTN_DISABLED_BG = "#f0f0f0"
     BTN_DISABLED_FG = "#a0a0a0"
 
-    BTN_PRIMARY_DISABLED_BG = "#94a3b8"
-    BTN_PRIMARY_DISABLED_FG = "#e2e8f0"
+    # Disabled-primary must read as "unavailable" like every other disabled
+    # button — the old steel-blue #94a3b8 looked like a live control.
+    BTN_PRIMARY_DISABLED_BG = "#dfe5ee"
+    BTN_PRIMARY_DISABLED_FG = "#a0a0a0"
 
     BTN_DESTRUCTIVE_FG = "#dc2626"
     BTN_DESTRUCTIVE_HOVER = "#fee2e2"
@@ -161,15 +162,12 @@ def install_modern_theme(dpi_scale: float = 1.0) -> None:
 
     style = ttk.Style()
 
-    # Base theme: clam on all platforms.
-    # Aqua (macOS native) was tested but conflicts with system dark mode:
-    # aqua inherits the system foreground colors (light text for dark mode)
-    # while our theme forces light backgrounds, producing invisible text.
-    # Deferred to a future PR that adds full dark mode support.
+    # Base theme: clam on all platforms. Aqua (macOS native) conflicts with
+    # system dark mode: aqua inherits the system foreground colors (light text
+    # for dark mode) while this theme forces light backgrounds, producing
+    # invisible text — so clam is used everywhere.
     base_theme = "clam"
-    use_aqua = False
 
-    # Use 'aqua' (macOS) or 'clam' as base — most customizable
     try:
         style.theme_create("modern", parent=base_theme, settings={
 
@@ -237,6 +235,11 @@ def install_modern_theme(dpi_scale: float = 1.0) -> None:
                     "borderwidth": 1,
                     "padding": (6, 4),
                     "arrowsize": 14,
+                    # Kill clam's 3D bevel: flat 1px border, muted arrow
+                    "bordercolor": Colors.BORDER_SEPARATOR,
+                    "lightcolor": Colors.BG_ELEVATED,
+                    "darkcolor": Colors.BG_ELEVATED,
+                    "arrowcolor": Colors.TEXT_SECONDARY,
                 },
                 "map": {
                     "fieldbackground": [("readonly", Colors.BG_ELEVATED)],
@@ -254,6 +257,9 @@ def install_modern_theme(dpi_scale: float = 1.0) -> None:
                     "padding": (6, 4),
                     "selectbackground": Colors.ACCENT,
                     "selectforeground": "white",
+                    "bordercolor": Colors.BORDER_SEPARATOR,
+                    "lightcolor": Colors.BG_ELEVATED,
+                    "darkcolor": Colors.BG_ELEVATED,
                 },
             },
 
@@ -276,6 +282,8 @@ def install_modern_theme(dpi_scale: float = 1.0) -> None:
                     "background": Colors.BG_PRIMARY,
                     "borderwidth": 0,
                     "tabmargins": (2, 4, 2, 0),
+                    "bordercolor": Colors.BORDER_CARD,
+                    "lightcolor": Colors.BG_PRIMARY,
                 },
             },
             "TNotebook.Tab": {
@@ -308,6 +316,9 @@ def install_modern_theme(dpi_scale: float = 1.0) -> None:
                     "borderwidth": 0,
                     "rowheight": _s(_BASE_ROWHEIGHT),
                     "font": (SYSTEM_FONT, _fs(10)),
+                    "bordercolor": Colors.BORDER_CARD,
+                    "lightcolor": Colors.BG_ELEVATED,
+                    "darkcolor": Colors.BG_ELEVATED,
                 },
                 "map": {
                     "background": [("selected", Colors.STATUS_RUNNING_BG)],
@@ -336,6 +347,7 @@ def install_modern_theme(dpi_scale: float = 1.0) -> None:
                     "borderwidth": 0,
                     "arrowsize": 0,
                     "width": _s(10),
+                    "bordercolor": Colors.SCROLLBAR_TROUGH,
                 },
                 "map": {
                     "background": [
@@ -351,6 +363,7 @@ def install_modern_theme(dpi_scale: float = 1.0) -> None:
                     "borderwidth": 0,
                     "arrowsize": 0,
                     "width": _s(10),
+                    "bordercolor": Colors.SCROLLBAR_TROUGH,
                 },
                 "map": {
                     "background": [
@@ -396,4 +409,70 @@ def install_modern_theme(dpi_scale: float = 1.0) -> None:
         raise
 
     style.theme_use("modern")
+    try:
+        _install_check_indicator(style, _s)
+    except Exception:
+        # Non-fatal: clam's stock indicator remains.
+        logger.warning("Could not install modern checkbutton indicator",
+                       exc_info=True)
     logger.debug("Applied modern ttk theme (base: clam)")
+
+
+# PhotoImages must outlive this function or Tk silently drops them.
+_CHECK_IMAGES: list = []
+
+
+def _install_check_indicator(style, _s) -> None:
+    """Replace clam's X-in-a-box Checkbutton indicator with a check-in-square.
+
+    An X in a box reads as "excluded", not "on". Images are drawn in code
+    with PhotoImage.put — self-contained, DPI-scaled, no asset pipeline.
+    Requires a live Tk root (install_modern_theme runs with one).
+    """
+    import tkinter as tk
+
+    size = _s(15)
+    gap = _s(5)  # transparent spacing between the box and the label
+
+    def _draw(fill, border, check=None):
+        img = tk.PhotoImage(width=size + gap, height=size)
+        img.put(fill, to=(0, 0, size, size))
+        img.put(border, to=(0, 0, size, 1))
+        img.put(border, to=(0, size - 1, size, size))
+        img.put(border, to=(0, 0, 1, size))
+        img.put(border, to=(size - 1, 0, size, size))
+        if check:
+            t = max(2, size // 7)
+            x0, y0 = round(size * 0.22), round(size * 0.48)
+            x1, y1 = round(size * 0.42), round(size * 0.68)
+            x2, y2 = round(size * 0.78), round(size * 0.28)
+            for xa, ya, xb, yb in ((x0, y0, x1, y1), (x1, y1, x2, y2)):
+                steps = max(1, xb - xa)
+                for i in range(steps + 1):
+                    x = xa + i
+                    y = ya + round(i * (yb - ya) / steps)
+                    img.put(check, to=(x, max(0, y - t + 1), x + 1, min(size, y + 1)))
+        _CHECK_IMAGES.append(img)
+        return img
+
+    img_off = _draw(Colors.BG_ELEVATED, Colors.BORDER_SEPARATOR)
+    img_on = _draw(Colors.ACCENT, Colors.ACCENT, check="white")
+    img_dis_off = _draw(Colors.BTN_DISABLED_BG, Colors.BORDER_LIGHT)
+    img_dis_on = _draw(Colors.TEXT_PLACEHOLDER, Colors.TEXT_PLACEHOLDER,
+                       check="white")
+
+    style.element_create(
+        "Modern.Checkbutton.indicator", "image", img_off,
+        ("disabled selected", img_dis_on),
+        ("disabled", img_dis_off),
+        ("selected", img_on),
+        sticky="",
+    )
+    style.layout("TCheckbutton", [
+        ("Checkbutton.padding", {"sticky": "nswe", "children": [
+            ("Modern.Checkbutton.indicator", {"side": "left", "sticky": ""}),
+            ("Checkbutton.focus", {"side": "left", "sticky": "w", "children": [
+                ("Checkbutton.label", {"sticky": "nswe"}),
+            ]}),
+        ]}),
+    ])

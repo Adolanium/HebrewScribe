@@ -218,7 +218,7 @@ class TestCountByStatus:
     def test_all_queued(self):
         h = IncrementalHarness(["a.wav", "b.wav", "c.wav"])
         counts = _count_by_status(h)
-        assert counts == {"Queued": 3, "Done": 0, "Failed": 0, "Running": 0}
+        assert counts == {"Queued": 3, "Done": 0, "Failed": 0, "Running": 0, "Cancelled": 0}
 
     def test_mixed_statuses(self):
         h = IncrementalHarness(
@@ -226,7 +226,7 @@ class TestCountByStatus:
             {"a.wav": "Done", "b.wav": "Done", "c.wav": "Failed", "d.wav": "Queued"}
         )
         counts = _count_by_status(h)
-        assert counts == {"Queued": 1, "Done": 2, "Failed": 1, "Running": 0}
+        assert counts == {"Queued": 1, "Done": 2, "Failed": 1, "Running": 0, "Cancelled": 0}
 
     def test_all_done(self):
         h = IncrementalHarness(
@@ -234,12 +234,12 @@ class TestCountByStatus:
             {"a.wav": "Done", "b.wav": "Done"}
         )
         counts = _count_by_status(h)
-        assert counts == {"Queued": 0, "Done": 2, "Failed": 0, "Running": 0}
+        assert counts == {"Queued": 0, "Done": 2, "Failed": 0, "Running": 0, "Cancelled": 0}
 
     def test_empty_queue(self):
         h = IncrementalHarness([])
         counts = _count_by_status(h)
-        assert counts == {"Queued": 0, "Done": 0, "Failed": 0, "Running": 0}
+        assert counts == {"Queued": 0, "Done": 0, "Failed": 0, "Running": 0, "Cancelled": 0}
 
     def test_with_running(self):
         h = IncrementalHarness(
@@ -247,7 +247,15 @@ class TestCountByStatus:
             {"a.wav": "Running", "b.wav": "Queued"}
         )
         counts = _count_by_status(h)
-        assert counts == {"Queued": 1, "Done": 0, "Failed": 0, "Running": 1}
+        assert counts == {"Queued": 1, "Done": 0, "Failed": 0, "Running": 1, "Cancelled": 0}
+
+    def test_with_cancelled(self):
+        h = IncrementalHarness(
+            ["a.wav", "b.wav", "c.wav"],
+            {"a.wav": "Done", "b.wav": "Cancelled", "c.wav": "Queued"}
+        )
+        counts = _count_by_status(h)
+        assert counts == {"Queued": 1, "Done": 1, "Failed": 0, "Running": 0, "Cancelled": 1}
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +280,17 @@ class TestUpdateContextualBanner:
         assert "ready to continue" in h._last_banner_text
         assert "1 done" in h._last_banner_text
         assert "2 queued" in h._last_banner_text
+        assert "Continue" in h.start_button.text
+        assert "2" in h.start_button.text
+
+    def test_cancelled_counts_toward_continue(self):
+        h = IncrementalHarness(
+            ["a.wav", "b.wav", "c.wav"],
+            {"a.wav": "Done", "b.wav": "Cancelled", "c.wav": "Queued"}
+        )
+        _update_contextual_banner(h)
+        assert h._last_banner_state == "ready"
+        assert "1 cancelled" in h._last_banner_text
         assert "Continue" in h.start_button.text
         assert "2" in h.start_button.text
 
@@ -396,3 +415,71 @@ class TestStartQueuesOnly:
         counts = _count_by_status(h)
         assert counts["Queued"] == 0
         assert counts["Failed"] == 1
+
+
+# ---------------------------------------------------------------------------
+# next_file must never touch the Treeview (worker thread — no Tk calls)
+# ---------------------------------------------------------------------------
+
+class _ExplodingTree:
+    def __getattr__(self, name):
+        raise AssertionError(f"next_file touched the Treeview (.{name})")
+
+
+class _NextFileHost:
+    def __init__(self):
+        self.file_paths = ["a.mp3", "b.mp3", "c.mp3"]
+        self.file_status = {"a.mp3": "Done", "b.mp3": "Queued", "c.mp3": "Queued"}
+        self._queue_lock = threading.Lock()
+        self.file_tree = _ExplodingTree()
+
+
+def test_next_file_reads_status_map_not_tree():
+    from hebrewscribe.app import TranscriberApp
+    host = _NextFileHost()
+    assert TranscriberApp.next_file(host) == "b.mp3"
+
+    host.file_status["b.mp3"] = "Running"
+    assert TranscriberApp.next_file(host) == "c.mp3"
+
+    host.file_status["c.mp3"] = "Failed"
+    assert TranscriberApp.next_file(host) is None
+
+
+def test_next_file_treats_unknown_path_as_queued():
+    from hebrewscribe.app import TranscriberApp
+    host = _NextFileHost()
+    host.file_paths.append("new.mp3")  # appended before refresh ran
+    host.file_status.update({"b.mp3": "Done", "c.mp3": "Done"})
+    assert TranscriberApp.next_file(host) == "new.mp3"
+
+
+# ---------------------------------------------------------------------------
+# _append_files must refuse additions while a run is active
+# ---------------------------------------------------------------------------
+
+class _AliveThread:
+    @staticmethod
+    def is_alive():
+        return True
+
+
+class _AppendHost:
+    def __init__(self):
+        self.worker_thread = _AliveThread()
+        self.file_paths = []
+        self.logged = []
+
+    def log(self, msg):
+        self.logged.append(msg)
+
+    def bell(self):
+        pass
+
+
+def test_append_files_blocked_mid_run():
+    from hebrewscribe.app import TranscriberApp
+    host = _AppendHost()
+    TranscriberApp._append_files(host, ["x.mp3"])
+    assert host.file_paths == []
+    assert any("running" in m.lower() for m in host.logged)

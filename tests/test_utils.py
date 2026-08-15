@@ -106,6 +106,28 @@ class TestLoadSaveJson(unittest.TestCase):
             result = load_json(p, "fallback")
             self.assertEqual(result, "fallback")
 
+    def test_load_corrupt_backs_up_original(self):
+        """A corrupt file is renamed aside, not left to be overwritten."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "bad.json"
+            p.write_text("not json{{{", encoding="utf-8")
+            load_json(p, {})
+            backup = Path(tmpdir) / "bad.json.corrupt.bak"
+            self.assertFalse(p.exists())
+            self.assertTrue(backup.exists())
+            self.assertEqual(backup.read_text(encoding="utf-8"), "not json{{{")
+
+    def test_save_leaves_no_temp_file(self):
+        """Atomic save: the .tmp intermediate must not survive."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "out.json"
+            save_json(p, {"a": 1})
+            self.assertEqual(load_json(p, {}), {"a": 1})
+            self.assertEqual(sorted(f.name for f in Path(tmpdir).iterdir()),
+                             ["out.json"])
+
 
 class TestWriteTxt(unittest.TestCase):
     def test_writes_text(self):
@@ -129,6 +151,38 @@ class TestWriteSrt(unittest.TestCase):
             content = p.read_text(encoding="utf-8")
             self.assertIn("1\n00:00:00,000 --> 00:00:01,500\nHello", content)
             self.assertIn("2\n00:00:01,500 --> 00:00:03,000\nWorld", content)
+
+
+def test_resilient_rotation_survives_oserror(tmp_path, monkeypatch):
+    """Log rotation must survive a locked log file (second app instance):
+    the handler reopens its stream instead of silently going dark."""
+    import logging
+    import logging.handlers
+    from hebrewscribe.utils import _ResilientRotatingFileHandler
+
+    log_file = tmp_path / "test.log"
+    handler = _ResilientRotatingFileHandler(str(log_file), maxBytes=50,
+                                            backupCount=2, encoding="utf-8")
+
+    def failing_rollover(self):
+        # Mimic the stock behaviour on Windows: stream closed, then the
+        # rename fails because another process holds the file open.
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+        raise OSError(32, "The process cannot access the file")
+
+    monkeypatch.setattr(logging.handlers.RotatingFileHandler,
+                        "doRollover", failing_rollover)
+
+    handler.doRollover()  # must not raise
+    assert handler.stream is not None and not handler.stream.closed
+
+    record = logging.LogRecord("t", logging.INFO, __file__, 1,
+                               "still logging", None, None)
+    handler.emit(record)
+    handler.close()
+    assert "still logging" in log_file.read_text(encoding="utf-8")
 
 
 if __name__ == "__main__":
