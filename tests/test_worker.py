@@ -16,7 +16,8 @@ from hebrewscribe.worker import (
     _completion_progress, _auto_batch_size, _get_batched_pipeline,
     _batched_pipeline_cache, preconvert_audio,
     _is_ct2_corruption_error, _find_hf_cache_dir,
-    _model_bin_status, _download_with_progress,
+    _model_bin_status, _download_with_progress, _discard_short_model_bin,
+    _MIN_MODEL_BIN_BYTES,
 )
 
 
@@ -671,6 +672,15 @@ class TestIsCt2CorruptionError(unittest.TestCase):
         exc = ValueError("[json.exception.type_error.305] wrong type")
         self.assertFalse(_is_ct2_corruption_error(exc))
 
+    def test_matches_incomplete_model_bin(self):
+        # Load-time error from ctranslate2 when model.bin is present but
+        # shorter than its header claims. Verbatim wording from ct2 4.7.1.
+        exc = RuntimeError(
+            "File model.bin is incomplete: failed to read a buffer of "
+            "size 39832320 at position 187"
+        )
+        self.assertTrue(_is_ct2_corruption_error(exc))
+
     def test_matches_unable_to_open_file(self):
         # Load-time error from ctranslate2 when model.bin is missing or its
         # binary format is incompatible with the installed ctranslate2 version.
@@ -715,6 +725,38 @@ class TestModelBinStatus(unittest.TestCase):
             self.assertIn("too small", detail)
 
 
+class TestDiscardShortModelBin(unittest.TestCase):
+    """A truncated model.bin must be removed; a complete one never is."""
+
+    def test_removes_short_model_bin(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            (d / "model.bin").write_bytes(b"x" * 1024)
+            self.assertTrue(_discard_short_model_bin(d))
+            self.assertFalse((d / "model.bin").exists())
+
+    def test_keeps_full_size_model_bin(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            (d / "model.bin").write_bytes(b"x" * (_MIN_MODEL_BIN_BYTES + 1))
+            self.assertFalse(_discard_short_model_bin(d))
+            self.assertTrue((d / "model.bin").exists())
+
+    def test_keeps_locked_model_bin(self):
+        """A full-size file we cannot stat/unlink must survive."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            (d / "model.bin").write_bytes(b"x" * (_MIN_MODEL_BIN_BYTES + 1))
+            with patch.object(Path, "unlink",
+                              side_effect=PermissionError("locked")):
+                self.assertFalse(_discard_short_model_bin(d))
+            self.assertTrue((d / "model.bin").exists())
+
+    def test_missing_model_bin_is_not_an_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.assertFalse(_discard_short_model_bin(Path(tmpdir)))
+
+
 class TestDownloadCacheCheck(unittest.TestCase):
     """An unfinished cache must resume, not raise and not count as done."""
 
@@ -754,6 +796,36 @@ class TestDownloadCacheCheck(unittest.TestCase):
             ]
             self.assertTrue(any("incomplete" in m.lower() for m in messages))
             self.assertFalse(any("already cached" in m.lower() for m in messages))
+
+    def test_truncated_model_bin_is_deleted_before_retry(self):
+        """Without the delete, hub skips the existing file and fetches nothing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            snap = Path(tmpdir) / "snap"
+            snap.mkdir()
+            (snap / "model.bin").write_bytes(b"x" * 1024)   # truncated
+            (snap / "config.json").write_text("{}", encoding="utf-8")
+            (snap / "tokenizer.json").write_text("{}", encoding="utf-8")
+
+            seen = []
+
+            def fake_snapshot(repo_id, local_files_only=False, **kwargs):
+                seen.append((snap / "model.bin").exists())
+                if not local_files_only:
+                    (snap / "model.bin").write_bytes(
+                        b"x" * (11 * 1024 * 1024))
+                return str(snap)
+
+            host = MagicMock()
+            fake_hub = types.ModuleType("huggingface_hub")
+            fake_hub.snapshot_download = fake_snapshot
+            with patch.dict("sys.modules", {"huggingface_hub": fake_hub}):
+                result = _download_with_progress(host, "org/model")
+
+            # First call sees the stub; the retry must see it gone.
+            self.assertEqual(seen, [True, False])
+            self.assertEqual(result, str(snap))
+            ok, _ = _model_bin_status(Path(result))
+            self.assertTrue(ok)
 
     def test_complete_cache_is_used(self):
         with tempfile.TemporaryDirectory() as tmpdir:

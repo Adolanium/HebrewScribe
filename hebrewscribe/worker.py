@@ -296,6 +296,11 @@ def _is_ct2_corruption_error(exc: Exception) -> bool:
        installer against Python 3.14 bundles a newer ctranslate2 that cannot
        read a model.bin written by an older version).  Re-downloading forces
        huggingface_hub to fetch files compatible with the current library.
+
+    3. **Load-time "is incomplete" errors** — raised when ``model.bin`` exists
+       but is shorter than its header claims (download killed, disk full,
+       antivirus truncation).  CTranslate2 reports the byte offset it could not
+       reach rather than a JSON or open failure, so this needs its own match.
     """
     if not isinstance(exc, RuntimeError):
         return False
@@ -303,6 +308,7 @@ def _is_ct2_corruption_error(exc: Exception) -> bool:
     return (
         "json.exception.type_error" in msg
         or "Unable to open file" in msg
+        or "is incomplete" in msg
     )
 
 
@@ -349,6 +355,32 @@ def _model_bin_status(model_dir: Path) -> tuple[bool, str]:
         return False, f"cannot read model.bin: {exc}"
 
     return True, f"model.bin ok ({size} bytes)"
+
+
+def _discard_short_model_bin(model_dir: Path) -> bool:
+    """Delete ``model.bin`` in *model_dir* if it is present but too short.
+
+    huggingface_hub returns early for any file that already exists on disk —
+    it compares presence, not length — so a truncated weight file survives a
+    re-download and the caller is told the fetch succeeded.  Removing it first
+    makes the retry fetch the file for real.
+
+    Only a *short* file is removed.  A full-size file that merely cannot be
+    opened (antivirus, backup, another process) is left alone: deleting a
+    complete model over a transient lock is exactly the damage this code path
+    exists to avoid.  Returns True if a file was deleted.
+    """
+    model_bin = model_dir / "model.bin"
+    try:
+        if model_bin.stat().st_size >= _MIN_MODEL_BIN_BYTES:
+            return False
+        model_bin.unlink()
+    except OSError:
+        logger.debug("Could not discard short model.bin: %s", model_bin,
+                     exc_info=True)
+        return False
+    logger.warning("Discarded truncated model.bin: %s", model_bin)
+    return True
 
 
 def _find_hf_cache_dir(model_spec: str) -> Optional[Path]:
@@ -502,8 +534,13 @@ def _download_with_progress(host: WorkerHost, repo_id: str) -> str:
     immediately with no download events.
 
     A folder created before ``model.bin`` finished is not treated as a cache
-    hit. The download is resumed instead of raising, so the existing
-    load-failure repair can still run if the files stay unusable.
+    hit: the download is retried rather than raising, so a half-finished
+    fetch completes itself instead of failing the batch.
+
+    A ``model.bin`` that exists but is too short is deleted first.
+    huggingface_hub returns early for any file that merely exists (it compares
+    presence, not length), so without the delete the retry would transfer zero
+    bytes and still report success.
     """
     import huggingface_hub
 
@@ -522,6 +559,10 @@ def _download_with_progress(host: WorkerHost, repo_id: str) -> str:
         if ok:
             host.post_event("log", message=f"Model already cached: {repo_id}")
             return local
+        # Remove a short model.bin before retrying: huggingface_hub skips any
+        # file that already exists, so leaving it in place would make the
+        # retry a no-op that still reports "Download complete".
+        _discard_short_model_bin(Path(local))
         host.post_event(
             "log",
             message=(
