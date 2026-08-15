@@ -19,10 +19,56 @@ def get_log_dir() -> Path:
     return log_dir
 
 
+def get_models_dir() -> Path:
+    """Return the app-managed models directory (~/.hebrewscribe/models/),
+    creating it if needed."""
+    models_dir = Path.home() / ".hebrewscribe" / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
+    return models_dir
+
+
+def bidi_name(name: str) -> str:
+    """Wrap a filename for DISPLAY when its first strong character is RTL.
+
+    Mixed Hebrew + digits + ".ext" names render scrambled under Tk's LTR
+    paragraph direction; an RLE…PDF embedding gives the whole name an RTL
+    base, matching how Explorer/Finder render it. Display-only — the result
+    must never be used as a lookup key or written to disk.
+    """
+    for ch in name:
+        o = ord(ch)
+        if 0x0590 <= o <= 0x08FF or 0xFB1D <= o <= 0xFDFF or 0xFE70 <= o <= 0xFEFF:
+            # RLE … PDF, then LRM: without the trailing mark, neutrals that
+            # FOLLOW the name in a larger LTR string (" (42%)" in the banner)
+            # got pulled into the RTL run and rendered scrambled.
+            return chr(0x202B) + name + chr(0x202C) + chr(0x200E)
+        if (0x41 <= o <= 0x5A) or (0x61 <= o <= 0x7A) or o >= 0xC0:
+            return name  # first strong character is LTR
+    return name
+
+
+class _ResilientRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """Rotation that survives another process holding the log file open.
+
+    On Windows a second app instance keeps hebrewscribe.log locked, so the
+    stock doRollover's rename raises PermissionError with the stream already
+    closed — after which EVERY subsequent record is silently dropped. Keep
+    appending unrotated instead; rotation is retried on a later emit once
+    the other instance exits.
+    """
+
+    def doRollover(self):
+        try:
+            super().doRollover()
+        except OSError:
+            if self.stream is None or self.stream.closed:
+                self.stream = self._open()
+
+
 def setup_logging() -> None:
     """Configure the HebrewScribe logger with console + rotating file handlers.
 
-    Console: INFO level (existing behaviour).
+    Console: INFO level.
     File:    DEBUG level, 2 MB per file, 3 backups (~8 MB max).
 
     Safe to call multiple times — skips if handlers are already attached.
@@ -34,7 +80,7 @@ def setup_logging() -> None:
 
     root_logger.setLevel(logging.DEBUG)
 
-    # Console handler (INFO) — matches the existing format from app.py
+    # Console handler (INFO)
     if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
                for h in root_logger.handlers):
         console = logging.StreamHandler()
@@ -47,7 +93,7 @@ def setup_logging() -> None:
     # Rotating file handler (DEBUG)
     try:
         log_path = get_log_dir() / "hebrewscribe.log"
-        file_handler = logging.handlers.RotatingFileHandler(
+        file_handler = _ResilientRotatingFileHandler(
             log_path,
             maxBytes=2 * 1024 * 1024,  # 2 MB
             backupCount=3,
@@ -156,17 +202,40 @@ OUTPUT_FORMATS = ["txt", "srt", "json"]
 
 
 def load_json(path: Path, default):
+    if not path.exists():
+        return default
     try:
-        if path.exists():
-            return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        logger.warning("Failed to load JSON from %s", path, exc_info=True)
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        # Transient I/O failure (lock, permissions): the file may be perfectly
+        # valid — leave it alone so a later read can succeed.
+        logger.warning("Could not read %s", path, exc_info=True)
+        return default
+    except UnicodeDecodeError:
+        raw = None  # not text — corrupt content, back it up below
+    if raw is not None:
+        try:
+            return json.loads(raw)
+        except ValueError:
+            logger.warning("Failed to parse JSON from %s", path, exc_info=True)
+    # Corrupt content: preserve the file — the next save_json would otherwise
+    # overwrite it with defaults, silently destroying its contents.
+    try:
+        backup = path.with_name(path.name + ".corrupt.bak")
+        path.replace(backup)
+        logger.warning("Backed up unreadable JSON to %s", backup)
+    except OSError:
+        logger.warning("Could not back up %s", path, exc_info=True)
     return default
 
 
 def save_json(path: Path, payload) -> None:
     try:
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        # Write-then-rename so a crash mid-write can't truncate the file
+        # (os.replace is atomic on both POSIX and Windows).
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
     except Exception:
         logger.warning("Failed to save JSON to %s", path, exc_info=True)
 

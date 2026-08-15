@@ -21,7 +21,8 @@ from hebrewscribe.utils import (
     _bundled_bin, _selftest_audio_path, ffmpeg_available,
     probe_duration_seconds, safe_stem, unique_stem,
 )
-from hebrewscribe.outputs import write_txt, write_srt, write_json
+from hebrewscribe.outputs import (format_speaker_transcript, write_txt,
+                                  write_srt, write_json)
 
 logger = logging.getLogger("HebrewScribe")
 
@@ -48,6 +49,11 @@ class RunOptions:
     condition_on_previous_text: bool
     batch_size: int
     formats: List[str]
+    # Diarization fields default off: RunOptions is also constructed by
+    # app.get_run_options and run_selftest — defaults keep old call sites valid.
+    diarize: bool = False
+    num_speakers: int = 0        # 0 = auto-detect
+    diarize_device: str = "auto"  # "auto" | "cpu" (macOS device preference)
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +74,8 @@ def _validate_opts(opts: RunOptions) -> None:
         raise ValueError(f"beam_size must be >= 1, got {opts.beam_size}")
     if not opts.formats:
         raise ValueError("formats must contain at least one output format")
+    if opts.num_speakers < 0:
+        raise ValueError(f"num_speakers must be >= 0, got {opts.num_speakers}")
     out_dir = Path(opts.output_dir)
     if not out_dir.is_dir():
         raise ValueError(f"output_dir does not exist: {opts.output_dir}")
@@ -94,6 +102,10 @@ def wait_if_paused(host: WorkerHost) -> None:
         check_for_cancel(host)
         host.post_event("paused")
         time.sleep(0.15)
+    # Cancel can land between the last in-loop check and the resume; without
+    # this, "Cancel" pressed while paused let the worker start (and
+    # preconvert) the next file before taking effect.
+    check_for_cancel(host)
     host.post_event("resumed")
 
 
@@ -405,8 +417,6 @@ def load_model(host: WorkerHost, opts: RunOptions):
     compute_type = opts.compute_type
     if compute_type == "auto":
         compute_type = "float16" if device == "cuda" else "int8"
-    elif compute_type == "default":
-        compute_type = "default"
 
     # Pre-download hub models with progress reporting.
     # A HuggingFace repo ID looks like "org/model" (one slash, no path separators).
@@ -604,7 +614,13 @@ def _emit_progress(host: WorkerHost, file_path: Path, phase: str,
 
 
 def _normalize_segment(seg, from_dict: bool = False) -> dict:
-    """Build a canonical segment dict from openai (dict) or faster-whisper (object)."""
+    """Build a canonical segment dict from openai (dict) or faster-whisper (object).
+
+    When faster-whisper ran with word_timestamps=True the dict also carries
+    "words": [{"start", "end", "word"}]. The key is absent otherwise, so
+    diarization-off outputs stay byte-identical. The openai path never carries
+    words — that backend gets segment-level speaker assignment only.
+    """
     if from_dict:
         text = (seg.get("text") or "").strip()
         return {
@@ -614,12 +630,19 @@ def _normalize_segment(seg, from_dict: bool = False) -> dict:
             "text": text,
         }
     text = (seg.text or "").strip()
-    return {
+    normed = {
         "id": getattr(seg, "id", None),
         "start": float(seg.start),
         "end": float(seg.end),
         "text": text,
     }
+    words = getattr(seg, "words", None)
+    if words:
+        normed["words"] = [
+            {"start": float(w.start), "end": float(w.end), "word": w.word}
+            for w in words
+        ]
+    return normed
 
 
 def _completion_progress(host: WorkerHost, file_path: Path,
@@ -638,14 +661,19 @@ def _completion_progress(host: WorkerHost, file_path: Path,
 # Transcription backends
 # ---------------------------------------------------------------------------
 
-def transcribe_openai(host: WorkerHost, model, file_path: Path, opts: RunOptions, device: str) -> dict:
+def transcribe_openai(host: WorkerHost, model, file_path: Path, opts: RunOptions, device: str,
+                      display_path: Optional[Path] = None) -> dict:
+    # display_path: the original source file for events/UI. file_path may be a
+    # pre-converted temp WAV whose path the GUI doesn't know (rows are keyed by
+    # the original path), so events must never carry it.
+    display_path = display_path or file_path
     check_for_cancel(host)
     wait_if_paused(host)
 
     duration = probe_duration_seconds(file_path)
     start_wall = time.time()
-    host.post_event("current_file", name=file_path.name, phase="Transcribing (openai-whisper)")
-    _emit_progress(host, file_path, "Transcribing (openai-whisper)",
+    host.post_event("current_file", name=display_path.name, phase="Transcribing (openai-whisper)")
+    _emit_progress(host, display_path, "Transcribing (openai-whisper)",
                    0, 0, None, None, 0, duration)
 
     fp16 = device == "cuda"
@@ -669,7 +697,7 @@ def transcribe_openai(host: WorkerHost, model, file_path: Path, opts: RunOptions
         if normed["text"]:
             preview_lines.append(normed["text"])
 
-    _completion_progress(host, file_path, start_wall, duration, segments)
+    _completion_progress(host, display_path, start_wall, duration, segments)
 
     if preview_lines:
         host.post_event("preview", text="\n".join(preview_lines[-8:]))
@@ -682,7 +710,11 @@ def transcribe_openai(host: WorkerHost, model, file_path: Path, opts: RunOptions
     }
 
 
-def transcribe_faster(host: WorkerHost, model, file_path: Path, opts: RunOptions) -> dict:
+def transcribe_faster(host: WorkerHost, model, file_path: Path, opts: RunOptions,
+                      display_path: Optional[Path] = None) -> dict:
+    # See transcribe_openai: events carry display_path (the original source
+    # file), while file_path may be a pre-converted temp WAV.
+    display_path = display_path or file_path
     check_for_cancel(host)
     wait_if_paused(host)
 
@@ -695,6 +727,11 @@ def transcribe_faster(host: WorkerHost, model, file_path: Path, opts: RunOptions
     }
     if opts.vad_filter:
         kwargs["vad_filter"] = True
+    if opts.diarize:
+        # Word-level speaker assignment needs word timestamps (~10-30% CPU
+        # cost). NOTE: combined with vad_filter, faster-whisper rewrites
+        # segment start/end to the first/last word times.
+        kwargs["word_timestamps"] = True
 
     effective_batch = opts.batch_size
     if effective_batch == 0:
@@ -702,7 +739,7 @@ def transcribe_faster(host: WorkerHost, model, file_path: Path, opts: RunOptions
     if effective_batch > 1:
         kwargs["batch_size"] = effective_batch
 
-    host.post_event("current_file", name=file_path.name, phase="Initializing (faster-whisper)")
+    host.post_event("current_file", name=display_path.name, phase="Initializing (faster-whisper)")
     transcriber = _get_batched_pipeline(model) if effective_batch > 1 else model
     segments_iter, info = transcriber.transcribe(str(file_path), **kwargs)
 
@@ -713,7 +750,7 @@ def transcribe_faster(host: WorkerHost, model, file_path: Path, opts: RunOptions
     texts = []
 
     detected_language = getattr(info, "language", None)
-    host.post_event("current_file", name=file_path.name, phase="Transcribing", language=detected_language)
+    host.post_event("current_file", name=display_path.name, phase="Transcribing", language=detected_language)
 
     for seg in segments_iter:
         check_for_cancel(host)
@@ -733,12 +770,12 @@ def transcribe_faster(host: WorkerHost, model, file_path: Path, opts: RunOptions
             elapsed = now - start_wall
             speed = (processed_seconds / elapsed) if elapsed > 0 else None
             eta = ((total_seconds - processed_seconds) / speed) if (speed and total_seconds and speed > 0) else None
-            _emit_progress(host, file_path, "Transcribing",
+            _emit_progress(host, display_path, "Transcribing",
                            percent, elapsed, eta, speed,
                            processed_seconds, total_seconds)
             last_emit = now
 
-    _completion_progress(host, file_path, start_wall, total_seconds, segments)
+    _completion_progress(host, display_path, start_wall, total_seconds, segments)
 
     return {
         "text": " ".join([t for t in texts if t]).strip(),
@@ -756,6 +793,76 @@ def transcribe_faster(host: WorkerHost, model, file_path: Path, opts: RunOptions
 
 
 # ---------------------------------------------------------------------------
+# Speaker diarization (optional post-transcription pass)
+# ---------------------------------------------------------------------------
+
+def _diarize_file(host: WorkerHost, dia_pipeline, audio_path: Path,
+                  display_path: Path, opts: RunOptions, result: dict,
+                  file_duration) -> None:
+    """Run diarization on one file and label the result's segments in place.
+
+    Failure policy: any per-file diarization error —
+    including MemoryError from pyannote's reconstruction memory spike on
+    multi-hour audio — keeps the transcript and drops only the speaker
+    labels; the batch continues. Cancellation propagates as CancelledByUser.
+    """
+    from hebrewscribe import diarize as dz
+
+    check_for_cancel(host)
+    wait_if_paused(host)
+    host.post_event("current_file", name=display_path.name,
+                    phase="Identifying speakers…",
+                    language=result.get("language"))
+    if file_duration and file_duration > dz.LONG_AUDIO_WARN_SECONDS:
+        host.post_event(
+            "log", level="warning",
+            message=f"Warning: {display_path.name} is over 2 hours long — "
+                    "speaker identification may use several GB of RAM.")
+    waveform = None
+    try:
+        waveform = dz.load_waveform(audio_path)
+        annotation = dz.diarize_waveform(
+            dia_pipeline, waveform, host, display_path,
+            num_speakers=opts.num_speakers, total_seconds=file_duration)
+        turns = dz.annotation_to_turns(annotation)
+        segments = dz.assign_speakers_to_segments(result["segments"], turns)
+        # Label language follows the OUTPUT text: task=translate produces
+        # English text, which must not carry Hebrew "דובר N" labels.
+        label_lang = ("en" if opts.task == "translate"
+                      else (result.get("language") or opts.language))
+        speakers = dz.build_speaker_map(segments, label_lang)
+        result["segments"] = segments
+        result["speakers"] = speakers
+        n = len(speakers)
+        host.post_event("log", message=f"Identified {n} speaker"
+                                       f"{'s' if n != 1 else ''}")
+        if speakers:
+            # Refresh the live preview with the labeled, turn-grouped text —
+            # exactly what write_txt will produce for this file. The preview
+            # holds only the current file (cleared on every file_started), so
+            # replace semantics are safe.
+            host.post_event("preview_replace",
+                            text=format_speaker_transcript(segments, speakers),
+                            language=("en" if opts.task == "translate"
+                                      else result.get("language")))
+    except dz.DiarizationCancelled:
+        raise CancelledByUser("Cancelled by user.")
+    except CancelledByUser:
+        raise
+    except Exception as exc:
+        # Transcript is preserved; only the labels are lost for this file.
+        host.post_event(
+            "log", level="warning",
+            message=f"Warning: speaker identification failed — keeping the "
+                    f"transcript without speaker labels ({exc})")
+        logger.warning("Diarization failed for %s", display_path,
+                       exc_info=True)
+    finally:
+        # Free multi-hour tensors before the next file.
+        del waveform
+
+
+# ---------------------------------------------------------------------------
 # Output writing
 # ---------------------------------------------------------------------------
 
@@ -766,10 +873,13 @@ def write_outputs(host: WorkerHost, source_file: Path, opts: RunOptions, result:
     if stem != safe_stem(source_file):
         host.post_event("log", message=f"Output renamed to '{stem}.*' to avoid collision")
 
+    speakers = result.get("speakers")
     if "txt" in opts.formats:
-        write_txt(out_dir / f"{stem}.txt", result["text"])
+        write_txt(out_dir / f"{stem}.txt", result["text"],
+                  segments=result["segments"], speakers=speakers)
     if "srt" in opts.formats:
-        write_srt(out_dir / f"{stem}.srt", result["segments"])
+        write_srt(out_dir / f"{stem}.srt", result["segments"],
+                  speakers=speakers)
     if "json" in opts.formats:
         write_json(out_dir / f"{stem}.json", str(source_file),
                    opts.backend, opts.model_spec, result)
@@ -810,6 +920,42 @@ def run_transcription_worker(host: WorkerHost, opts: RunOptions, total: int) -> 
             else:
                 raise
         host.post_event("log", message=f"Model loaded on device: {resolved_device}")
+
+        # --- Optional diarization pipeline (loaded once per batch) ---
+        # Any load failure degrades the whole batch to no-diarization; it
+        # never kills the run. Cancel during the first-use weights download
+        # propagates as a normal cancellation.
+        dia_pipeline = None
+        if opts.diarize:
+            host.post_event("job_status",
+                            message="Loading speaker identification model...")
+            try:
+                from hebrewscribe import diarize as _dz
+            except Exception:
+                _dz = None
+                logger.warning("hebrewscribe.diarize failed to import",
+                               exc_info=True)
+            if _dz is not None:
+                try:
+                    dia_pipeline = _dz.load_diarization_pipeline(
+                        host, opts.diarize_device)
+                except CancelledByUser:
+                    raise
+                except _dz.DiarizationCancelled:
+                    raise CancelledByUser("Cancelled by user.")
+                except Exception as dia_exc:
+                    host.post_event(
+                        "log", level="warning",
+                        message="Warning: speaker identification unavailable — "
+                                f"continuing without speaker labels ({dia_exc})")
+                    logger.warning("Diarization pipeline load failed",
+                                   exc_info=True)
+                    dia_pipeline = None
+            else:
+                host.post_event(
+                    "log", level="warning",
+                    message="Warning: speaker identification unavailable — "
+                            "continuing without speaker labels.")
         host.post_event("job_status", message="Model loaded. Ready to transcribe.")
 
         model_recovered = False  # True after one successful purge+reload
@@ -842,9 +988,15 @@ def run_transcription_worker(host: WorkerHost, opts: RunOptions, total: int) -> 
                 if audio_path != p:
                     host.post_event("log", message=f"Pre-converted to WAV: {audio_path.name}")
                 if opts.backend == "openai-whisper":
-                    result = transcribe_openai(host, model, audio_path, opts, resolved_device)
+                    result = transcribe_openai(host, model, audio_path, opts, resolved_device,
+                                               display_path=p)
                 else:
-                    result = transcribe_faster(host, model, audio_path, opts)
+                    result = transcribe_faster(host, model, audio_path, opts, display_path=p)
+
+                if dia_pipeline is not None:
+                    # Keep in sync with the corruption-retry call site below.
+                    _diarize_file(host, dia_pipeline, audio_path, p, opts,
+                                  result, file_duration)
 
                 check_for_cancel(host)
                 wait_if_paused(host)
@@ -884,7 +1036,12 @@ def run_transcription_worker(host: WorkerHost, opts: RunOptions, total: int) -> 
                                         duration=file_duration)
 
                         audio_path = preconvert_audio(p)
-                        result = transcribe_faster(host, model, audio_path, opts)
+                        result = transcribe_faster(host, model, audio_path, opts, display_path=p)
+
+                        if dia_pipeline is not None:
+                            # Keep in sync with the main call site above.
+                            _diarize_file(host, dia_pipeline, audio_path, p,
+                                          opts, result, file_duration)
 
                         check_for_cancel(host)
                         wait_if_paused(host)
@@ -947,6 +1104,11 @@ def run_transcription_worker(host: WorkerHost, opts: RunOptions, total: int) -> 
 SELFTEST_MODEL = "Systran/faster-whisper-tiny"
 
 
+# Number of checks run_selftest performs — keep in sync with its docstring
+# list; the GUI's "Running N checks…" label reads this.
+SELFTEST_CHECK_COUNT = 7
+
+
 @dataclass
 class SelfTestResult:
     """Result of run_selftest()."""
@@ -963,9 +1125,11 @@ def run_selftest(host: WorkerHost, backend: str, device: str,
     Tests:
       1. Test audio fixture is available
       2. ffmpeg is reachable
-      3. Model loads on the selected device/compute_type
-      4. Transcription produces non-empty output
-      5. Output files can be written
+      3. Backend package imports
+      4. Model loads on the selected device/compute_type
+      5. Transcription produces non-empty output
+      6. Output files can be written
+      7. Speaker identification loads (optional — skipped when not installed)
 
     Uses Systran/faster-whisper-tiny (~75 MB) regardless of the user's
     model selection, to keep the test fast (~2-5 seconds on CPU).
@@ -1060,6 +1224,34 @@ def run_selftest(host: WorkerHost, backend: str, device: str,
             else:
                 checks.append(f"[FAIL] Expected 3 output files, got {len(written)}")
                 return SelfTestResult(False, checks, None, time.time() - start)
+
+        # --- 7. Speaker identification (optional) ---
+        try:
+            from hebrewscribe.diarize import (is_diarization_available,
+                                              load_diarization_pipeline,
+                                              resolve_weights_dir)
+            if not is_diarization_available():
+                checks.append(
+                    "[--] Speaker identification not installed (optional)")
+            elif resolve_weights_dir() is None:
+                checks.append("[WARN] Speaker identification installed; "
+                              "model will download on first use")
+            else:
+                host.post_event("selftest_progress",
+                                step="Loading speaker model...")
+                try:
+                    load_diarization_pipeline(host, "cpu")
+                    checks.append("[OK] Speaker identification pipeline loads")
+                except Exception as dia_exc:
+                    checks.append(
+                        f"[FAIL] Speaker identification broken: {dia_exc}")
+                    return SelfTestResult(False, checks, None,
+                                          time.time() - start)
+        except CancelledByUser:
+            raise
+        except Exception as dia_exc:
+            checks.append(f"[WARN] Speaker identification check skipped: "
+                          f"{dia_exc}")
 
         elapsed = time.time() - start
         checks.append(f"\nAll checks passed in {elapsed:.1f}s")

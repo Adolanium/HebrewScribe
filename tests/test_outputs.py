@@ -45,7 +45,8 @@ class TestWriteJson(unittest.TestCase):
             "language": "he",
         }
         data = self._write_json_via_dispatcher("test.mp3", result)
-        self.assertEqual(data["source_file"], "/audio/test.mp3")
+        # write_outputs records str(source) — platform-native separators.
+        self.assertEqual(data["source_file"], str(Path("/audio/test.mp3")))
         self.assertEqual(data["backend"], "faster-whisper")
         self.assertEqual(data["model"], "large-v3")
         self.assertEqual(data["language"], "he")
@@ -187,7 +188,7 @@ class TestWriteOutputsEdgeCases(unittest.TestCase):
             opts = RunOptions(
                 backend="faster-whisper", model_spec="tiny", output_dir=tmpdir,
                 language="he", task="transcribe", device="cpu", compute_type="int8",
-                beam_size=1, vad_filter=True, condition_on_previous_text=False, batch_size=0, formats=["txt", "srt", "vtt", "json"],
+                beam_size=1, vad_filter=True, condition_on_previous_text=False, batch_size=0, formats=["txt", "srt", "json"],
             )
             mock_app = MagicMock()
             write_outputs(mock_app, Path("/a/empty.wav"), opts, result, set())
@@ -205,7 +206,7 @@ class TestWriteOutputsEdgeCases(unittest.TestCase):
             opts = RunOptions(
                 backend="faster-whisper", model_spec="tiny", output_dir=tmpdir,
                 language="he", task="transcribe", device="cpu", compute_type="int8",
-                beam_size=1, vad_filter=True, condition_on_previous_text=False, batch_size=0, formats=["srt", "vtt"],
+                beam_size=1, vad_filter=True, condition_on_previous_text=False, batch_size=0, formats=["srt"],
             )
             mock_app = MagicMock()
             # Should not crash
@@ -231,6 +232,121 @@ class TestWriteOutputsEdgeCases(unittest.TestCase):
             call_args = mock_app.post_event.call_args_list
             rename_calls = [c for c in call_args if "renamed" in str(c).lower()]
             self.assertTrue(len(rename_calls) > 0, "Expected a rename log event")
+
+
+class TestSpeakerAwareWriters(unittest.TestCase):
+    """Speaker-labeled output rendering (diarization feature)."""
+
+    SEGS = [
+        {"id": 0, "start": 0.0, "end": 2.0, "text": "שלום",
+         "speaker": "SPEAKER_00"},
+        {"id": 1, "start": 2.0, "end": 3.0, "text": "וברכה",
+         "speaker": "SPEAKER_00"},
+        {"id": 2, "start": 3.0, "end": 5.0, "text": "תודה",
+         "speaker": "SPEAKER_01"},
+    ]
+    SPEAKERS = {"SPEAKER_00": "דובר 1", "SPEAKER_01": "דובר 2"}
+
+    def test_write_txt_byte_identical_without_speakers(self):
+        from hebrewscribe.outputs import write_txt
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "t.txt"
+            write_txt(p, "  Hello world  ")
+            self.assertEqual(p.read_text(encoding="utf-8"), "Hello world\n")
+
+    def test_write_txt_turn_grouped_hebrew(self):
+        from hebrewscribe.outputs import write_txt
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "t.txt"
+            write_txt(p, "ignored full text", segments=self.SEGS,
+                      speakers=self.SPEAKERS)
+            expected = "דובר 1:\nשלום וברכה\n\nדובר 2:\nתודה\n"
+            self.assertEqual(p.read_text(encoding="utf-8"), expected)
+
+    def test_write_txt_none_speaker_unlabeled_paragraph(self):
+        from hebrewscribe.outputs import write_txt
+        segs = [
+            {"start": 0.0, "end": 1.0, "text": "labeled",
+             "speaker": "SPEAKER_00"},
+            {"start": 1.0, "end": 2.0, "text": "unlabeled", "speaker": None},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "t.txt"
+            write_txt(p, "x", segments=segs,
+                      speakers={"SPEAKER_00": "Speaker 1"})
+            content = p.read_text(encoding="utf-8")
+            self.assertIn("Speaker 1:\nlabeled", content)
+            self.assertIn("unlabeled", content)
+            self.assertNotIn("None", content)
+
+    def test_write_srt_prefix_no_voice_tags(self):
+        from hebrewscribe.outputs import write_srt
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "t.srt"
+            write_srt(p, self.SEGS, speakers=self.SPEAKERS)
+            content = p.read_text(encoding="utf-8")
+            self.assertIn("דובר 1: שלום", content)
+            self.assertIn("דובר 2: תודה", content)
+            self.assertNotIn("<v", content)
+
+    def test_write_srt_unchanged_without_speakers(self):
+        from hebrewscribe.outputs import write_srt
+        segs = [{"start": 0.0, "end": 1.0, "text": "hi",
+                 "speaker": "SPEAKER_00"}]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "t.srt"
+            write_srt(p, segs)
+            content = p.read_text(encoding="utf-8")
+            self.assertIn("\nhi\n", content)
+            self.assertNotIn("Speaker", content)
+
+    def test_write_json_speaker_fields_and_meta_map(self):
+        from hebrewscribe.outputs import write_json
+        result = {
+            "text": "שלום וברכה תודה",
+            "segments": self.SEGS,
+            "language": "he",
+            "speakers": self.SPEAKERS,
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "t.json"
+            write_json(p, "/a/x.wav", "faster-whisper", "large-v3", result)
+            data = json.loads(p.read_text(encoding="utf-8"))
+            self.assertEqual(data["segments"][0]["speaker"], "SPEAKER_00")
+            self.assertEqual(data["segments"][0]["speaker_label"], "דובר 1")
+            self.assertEqual(data["meta"]["speakers"], self.SPEAKERS)
+            # The input result's segments must not have been mutated.
+            self.assertNotIn("speaker_label", self.SEGS[0])
+
+    def test_format_speaker_transcript_matches_txt_output(self):
+        """The shared renderer IS the txt content (minus trailing newline) —
+        the preview refresh and the file must never diverge."""
+        from hebrewscribe.outputs import format_speaker_transcript, write_txt
+        rendered = format_speaker_transcript(self.SEGS, self.SPEAKERS)
+        self.assertEqual(rendered, "דובר 1:\nשלום וברכה\n\nדובר 2:\nתודה")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "t.txt"
+            write_txt(p, "x", segments=self.SEGS, speakers=self.SPEAKERS)
+            self.assertEqual(p.read_text(encoding="utf-8"), rendered + "\n")
+
+    def test_format_speaker_transcript_empty_segments(self):
+        from hebrewscribe.outputs import format_speaker_transcript
+        self.assertEqual(format_speaker_transcript([], self.SPEAKERS), "")
+
+    def test_write_json_off_path_has_no_new_keys(self):
+        from hebrewscribe.outputs import write_json
+        result = {
+            "text": "hi",
+            "segments": [{"id": 0, "start": 0.0, "end": 1.0, "text": "hi"}],
+            "language": "en",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "t.json"
+            write_json(p, "/a/x.wav", "faster-whisper", "tiny", result)
+            data = json.loads(p.read_text(encoding="utf-8"))
+            self.assertNotIn("speakers", data["meta"])
+            self.assertNotIn("speaker", data["segments"][0])
+            self.assertNotIn("speaker_label", data["segments"][0])
 
 
 class TestCancelledByUser(unittest.TestCase):

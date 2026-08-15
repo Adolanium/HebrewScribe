@@ -150,5 +150,99 @@ class TestEndToEnd(unittest.TestCase):
                             f"No model-loaded log event. Logs: {log_messages}")
 
 
+def _requires_pyannote():
+    """Skip diarization E2E if pyannote.audio is not installed."""
+    import importlib.util
+    try:
+        return importlib.util.find_spec("pyannote.audio") is None
+    except (ImportError, ValueError):
+        return True
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(_requires_faster_whisper(),
+                    reason="faster-whisper not installed")
+@pytest.mark.skipif(_requires_pyannote(),
+                    reason="pyannote.audio not installed")
+class TestEndToEndDiarization(unittest.TestCase):
+    """Real transcription + real diarization on the single-speaker fixture.
+
+    Offline-safe: skips (does not fail) when the diarization weights are not
+    already present locally — never triggers the first-use download in CI.
+    Two-speaker assignment behavior is covered deterministically by the unit
+    tests in test_diarize.py with faked turns; this test pins the real
+    pyannote API surface end-to-end.
+    """
+
+    def test_diarized_single_speaker_outputs(self):
+        from hebrewscribe.diarize import resolve_weights_dir
+        if resolve_weights_dir() is None:
+            self.skipTest("diarization weights not present locally")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            opts = RunOptions(
+                backend="faster-whisper",
+                model_spec=MODEL_REPO,
+                output_dir=tmpdir,
+                language="en",
+                task="transcribe",
+                device="cpu",
+                compute_type="int8",
+                beam_size=1,
+                vad_filter=False,
+                condition_on_previous_text=False,
+                batch_size=0,
+                formats=["txt", "srt", "json"],
+                diarize=True,
+                num_speakers=0,
+                diarize_device="cpu",
+            )
+            app = MockApp(files=[str(SPEECH_WAV)])
+            run_transcription_worker(app, opts, 1)
+
+            done = [e for e in app.events if e[0] == "done"][0][1]
+            self.assertEqual(done["done_count"], 1)
+            self.assertEqual(done["failed_count"], 0)
+
+            # Diarization must have succeeded, not degraded.
+            logs = [e[1].get("message", "") for e in app.events
+                    if e[0] == "log"]
+            self.assertFalse(
+                any("without speaker labels" in m for m in logs),
+                f"Diarization degraded: {logs}")
+            self.assertTrue(any(m.startswith("Identified ") for m in logs))
+
+            # Live-preview refresh fired with the labeled text.
+            replaces = [e[1] for e in app.events
+                        if e[0] == "preview_replace"]
+            self.assertEqual(len(replaces), 1)
+            self.assertTrue(replaces[0]["text"].startswith("Speaker 1:"))
+
+            out_dir = Path(tmpdir)
+            # Single-speaker fixture: structural assertions, not counts.
+            payload = json.loads(
+                (out_dir / "speech_6s.json").read_text("utf-8"))
+            speakers_map = payload["meta"].get("speakers", {})
+            seg_speakers = {s.get("speaker") for s in payload["segments"]
+                            if s.get("speaker") is not None}
+            self.assertTrue(seg_speakers, "No segment carries a speaker id")
+            self.assertEqual(seg_speakers, set(speakers_map.keys()),
+                             "meta.speakers inconsistent with segment ids")
+            for seg in payload["segments"]:
+                if seg.get("speaker") is not None:
+                    self.assertIn("speaker_label", seg)
+
+            txt = (out_dir / "speech_6s.txt").read_text("utf-8")
+            self.assertTrue(txt.startswith("Speaker 1:"),
+                            f"txt not turn-grouped: {txt[:60]!r}")
+            srt = (out_dir / "speech_6s.srt").read_text("utf-8")
+            cue_lines = [ln for ln in srt.splitlines()
+                         if ln and "-->" not in ln and not ln.isdigit()]
+            self.assertTrue(cue_lines)
+            for ln in cue_lines:
+                self.assertTrue(ln.startswith("Speaker "),
+                                f"srt cue lacks speaker prefix: {ln!r}")
+
+
 if __name__ == "__main__":
     unittest.main()

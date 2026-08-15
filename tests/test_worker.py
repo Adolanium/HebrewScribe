@@ -129,7 +129,7 @@ class TestWorkerStopAfterCurrent(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             call_count = [0]
 
-            def transcribe_then_stop(host, model, file_path, opts):
+            def transcribe_then_stop(host, model, file_path, opts, display_path=None):
                 call_count[0] += 1
                 if call_count[0] >= 1:
                     app.stop_requested = True
@@ -170,7 +170,7 @@ class TestWorkerCancel(unittest.TestCase):
 
     def test_cancel_during_transcription(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            def transcribe_and_cancel(host, model, file_path, opts):
+            def transcribe_and_cancel(host, model, file_path, opts, display_path=None):
                 app.cancel_requested = True
                 return _FAKE_RESULT.copy()
 
@@ -194,7 +194,7 @@ class TestWorkerFileError(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             call_count = [0]
 
-            def fail_first(host, model, file_path, opts):
+            def fail_first(host, model, file_path, opts, display_path=None):
                 call_count[0] += 1
                 if call_count[0] == 1:
                     raise RuntimeError("Simulated transcription error")
@@ -220,7 +220,7 @@ class TestWorkerFileError(unittest.TestCase):
 
     def test_all_files_fail(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            def always_fail(host, model, file_path, opts):
+            def always_fail(host, model, file_path, opts, display_path=None):
                 raise RuntimeError("always fails")
 
             patches, mocks = _patch_worker(
@@ -297,7 +297,7 @@ class TestWorkerEventSequence(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# #2: _validate_opts
+# _validate_opts
 # ---------------------------------------------------------------------------
 
 class TestValidateOpts(unittest.TestCase):
@@ -727,7 +727,7 @@ class TestModelCorruptionRecovery(unittest.TestCase):
 
             call_count = [0]
 
-            def transcribe_fail_then_succeed(host, model, file_path, opts):
+            def transcribe_fail_then_succeed(host, model, file_path, opts, display_path=None):
                 call_count[0] += 1
                 if call_count[0] == 1:
                     raise RuntimeError(
@@ -773,7 +773,7 @@ class TestModelCorruptionRecovery(unittest.TestCase):
 
             call_count = [0]
 
-            def transcribe_fail_or_succeed(host, model, file_path, opts):
+            def transcribe_fail_or_succeed(host, model, file_path, opts, display_path=None):
                 call_count[0] += 1
                 # Calls 1 (file1 fail) and 2 (file1 retry) and 3 (file2 fail)
                 if call_count[0] in (1, 4):
@@ -910,6 +910,48 @@ class TestModelCorruptionRecovery(unittest.TestCase):
             self.assertTrue(len(failed_events) > 0)
 
 
+class TestDisplayPathInEvents(unittest.TestCase):
+    """Progress/current_file events must carry the original source path even
+    when the audio was pre-converted to a temp WAV — GUI rows are keyed by the
+    original path, so a temp path would silently kill per-row progress."""
+
+    def test_preconverted_events_use_original_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            opts = _make_opts(tmpdir)
+            audio = _make_fake_audio(tmpdir, "song.mp3")
+            temp_wav = Path(tmpdir) / "song_abc123.wav"
+            temp_wav.write_bytes(b"RIFF" + b"\x00" * 50)
+
+            seg = types.SimpleNamespace(id=0, start=0.0, end=1.0, text="hi")
+            info = types.SimpleNamespace(duration=1.0, language="he",
+                                         language_probability=1.0)
+            model = MagicMock(name="fake_model")
+            model.transcribe.return_value = (iter([seg]), info)
+
+            app = MockApp(files=[audio])
+            patches, mocks = _patch_worker(
+                load_model=MagicMock(return_value=(model, "cpu")),
+                preconvert_audio=MagicMock(return_value=temp_wav),
+            )
+            # transcribe_faster is deliberately NOT patched — the real one
+            # must route display_path into its events.
+            with patches["load_model"], patches["preconvert_audio"], \
+                 patches["probe_duration_seconds"], \
+                 patches["validate_audio_file"]:
+                run_transcription_worker(app, opts, 1)
+
+            # The model was fed the temp WAV...
+            model.transcribe.assert_called_once()
+            self.assertEqual(model.transcribe.call_args[0][0], str(temp_wav))
+            # ...but every event names the original file.
+            prog_paths = {e[1]["path"] for e in app.events
+                          if e[0] == "current_progress"}
+            self.assertEqual(prog_paths, {audio})
+            names = {e[1]["name"] for e in app.events if e[0] == "current_file"}
+            self.assertIn("song.mp3", names)
+            self.assertNotIn(temp_wav.name, names)
+
+
 class TestPullBasedFileOrder(unittest.TestCase):
     """Verify that the pull-based worker processes files in next_file() order."""
 
@@ -968,6 +1010,378 @@ class TestPullBasedFileOrder(unittest.TestCase):
             self.assertEqual(done_event[1]["done_count"], 0)
             self.assertEqual(done_event[1]["failed_count"], 0)
             self.assertIn("Finished", done_event[1]["message"])
+
+
+class TestWorkerDiarization(unittest.TestCase):
+    """Diarization integration: RunOptions, kwargs gating, flow, degrade paths."""
+
+    DIARIZE_MODULE = "hebrewscribe.diarize"
+
+    def _diarize_patches(self, **overrides):
+        """Patches on hebrewscribe.diarize used by the worker's lazy imports."""
+        from types import SimpleNamespace
+        turns = [{"start": 0.0, "end": 1.0, "speaker": "SPEAKER_00"}]
+        defaults = {
+            "load_diarization_pipeline": MagicMock(return_value="fake-pipeline"),
+            "load_waveform": MagicMock(
+                return_value={"waveform": SimpleNamespace(), "sample_rate": 16000}),
+            "diarize_waveform": MagicMock(return_value="fake-annotation"),
+            "annotation_to_turns": MagicMock(return_value=turns),
+        }
+        defaults.update(overrides)
+        return {name: patch(f"{self.DIARIZE_MODULE}.{name}", mock)
+                for name, mock in defaults.items()}, defaults
+
+    def _run(self, opts, app, dia_overrides=None, worker_overrides=None):
+        patches, mocks = _patch_worker(**(worker_overrides or {}))
+        dia_patches, dia_mocks = self._diarize_patches(**(dia_overrides or {}))
+        with patches["load_model"], patches["transcribe_faster"], \
+             patches["transcribe_openai"], patches["preconvert_audio"], \
+             patches["probe_duration_seconds"], \
+             patches["validate_audio_file"], \
+             dia_patches["load_diarization_pipeline"], \
+             dia_patches["load_waveform"], dia_patches["diarize_waveform"], \
+             dia_patches["annotation_to_turns"]:
+            run_transcription_worker(app, opts, 1)
+        return mocks, dia_mocks
+
+    def test_runoptions_new_fields_default_off(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            opts = _make_opts(tmpdir)  # constructed without the new kwargs
+            self.assertFalse(opts.diarize)
+            self.assertEqual(opts.num_speakers, 0)
+            self.assertEqual(opts.diarize_device, "auto")
+
+    def test_validate_opts_rejects_negative_num_speakers(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            opts = _make_opts(tmpdir)
+            opts.num_speakers = -1
+            with self.assertRaises(ValueError):
+                _validate_opts(opts)
+
+    def test_normalize_segment_words_carried_and_absent(self):
+        seg = types.SimpleNamespace(
+            id=1, start=0.0, end=2.0, text="hi there",
+            words=[types.SimpleNamespace(start=0.0, end=0.9, word="hi"),
+                   types.SimpleNamespace(start=1.0, end=1.9, word=" there")])
+        normed = _normalize_segment(seg)
+        self.assertEqual(normed["words"], [
+            {"start": 0.0, "end": 0.9, "word": "hi"},
+            {"start": 1.0, "end": 1.9, "word": " there"}])
+        seg_no_words = types.SimpleNamespace(id=1, start=0.0, end=2.0,
+                                             text="hi", words=None)
+        self.assertNotIn("words", _normalize_segment(seg_no_words))
+
+    def test_transcribe_faster_word_timestamps_only_when_diarizing(self):
+        from hebrewscribe.worker import transcribe_faster
+        for diarize_on in (False, True):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                opts = _make_opts(tmpdir)
+                opts.batch_size = 1  # avoid the batched-pipeline path
+                opts.diarize = diarize_on
+                seen = {}
+
+                def fake_transcribe(path, **kwargs):
+                    seen.update(kwargs)
+                    info = types.SimpleNamespace(
+                        duration=1.0, language="he", language_probability=1.0)
+                    return iter([]), info
+
+                model = types.SimpleNamespace(transcribe=fake_transcribe)
+                app = MockApp()
+                transcribe_faster(app, model, Path(tmpdir) / "a.wav", opts)
+                self.assertEqual("word_timestamps" in seen, diarize_on,
+                                 f"diarize={diarize_on}: kwargs={sorted(seen)}")
+
+    def test_diarize_happy_flow_labels_output(self):
+        import json as json_mod
+        with tempfile.TemporaryDirectory() as tmpdir:
+            opts = _make_opts(tmpdir, formats=["txt", "srt", "json"])
+            opts.diarize = True
+            audio = _make_fake_audio(tmpdir, "hello.wav")
+            app = MockApp(files=[audio])
+            self._run(opts, app)
+            txt = (Path(tmpdir) / "hello.txt").read_text(encoding="utf-8")
+            self.assertEqual(txt, "דובר 1:\ntranscribed text\n")
+            # srt/json must receive speakers through the REAL dispatcher —
+            # guards the write_outputs speakers= passthrough for each writer.
+            srt = (Path(tmpdir) / "hello.srt").read_text(encoding="utf-8")
+            self.assertIn("דובר 1: transcribed text", srt)
+            self.assertIn("-->", srt)
+            data = json_mod.loads(
+                (Path(tmpdir) / "hello.json").read_text(encoding="utf-8"))
+            self.assertEqual(data["segments"][0]["speaker"], "SPEAKER_00")
+            self.assertEqual(data["segments"][0]["speaker_label"], "דובר 1")
+            self.assertEqual(data["meta"]["speakers"],
+                             {"SPEAKER_00": "דובר 1"})
+            phases = [p.get("phase") for k, p in app.events
+                      if k == "current_file"]
+            self.assertIn("Identifying speakers…", phases)
+            logs = [p["message"] for k, p in app.events if k == "log"]
+            self.assertIn("Identified 1 speaker", logs)
+            # Live-preview refresh: the labeled text is posted and matches
+            # the .txt content exactly.
+            replaces = [p for k, p in app.events if k == "preview_replace"]
+            self.assertEqual(len(replaces), 1)
+            self.assertEqual(replaces[0]["text"] + "\n", txt)
+            done = [p for k, p in app.events if k == "done"][0]
+            self.assertEqual(done["done_count"], 1)
+            self.assertEqual(done["failed_count"], 0)
+
+    def test_no_turns_keeps_plain_output(self):
+        """Diarizer succeeds but finds no speech turns (music/silence):
+        outputs must be identical to a plain transcript — no labels invented."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            opts = _make_opts(tmpdir, formats=["txt"])
+            opts.diarize = True
+            audio = _make_fake_audio(tmpdir, "hello.wav")
+            app = MockApp(files=[audio])
+            self._run(opts, app, dia_overrides={
+                "annotation_to_turns": MagicMock(return_value=[])})
+            txt = (Path(tmpdir) / "hello.txt").read_text(encoding="utf-8")
+            self.assertEqual(txt, "transcribed text\n")
+            logs = [p["message"] for k, p in app.events if k == "log"]
+            self.assertIn("Identified 0 speakers", logs)
+            # No labels → no preview refresh (nothing to show over the stream).
+            kinds = [e[0] for e in app.events]
+            self.assertNotIn("preview_replace", kinds)
+            done = [p for k, p in app.events if k == "done"][0]
+            self.assertEqual(done["done_count"], 1)
+            self.assertEqual(done["failed_count"], 0)
+
+    def test_cancel_during_pipeline_load_cancels_run(self):
+        """Cancel during the batch-start weights download must cancel the
+        whole run (the DiarizationCancelled -> CancelledByUser conversion in
+        the pipeline-load block), never degrade into a label-less batch."""
+        from hebrewscribe.diarize import DiarizationCancelled
+        with tempfile.TemporaryDirectory() as tmpdir:
+            opts = _make_opts(tmpdir, formats=["txt"])
+            opts.diarize = True
+            audio = _make_fake_audio(tmpdir, "hello.wav")
+            app = MockApp(files=[audio])
+            _, dia_mocks = self._run(opts, app, dia_overrides={
+                "load_diarization_pipeline": MagicMock(
+                    side_effect=DiarizationCancelled())})
+            done = [p for k, p in app.events if k == "done"][0]
+            self.assertTrue(done["cancelled"])
+            self.assertEqual(done["done_count"], 0)
+            kinds = [e[0] for e in app.events]
+            self.assertNotIn("file_finished", kinds)
+
+    def test_pipeline_load_failure_degrades_batch(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            opts = _make_opts(tmpdir, formats=["txt"])
+            opts.diarize = True
+            audio = _make_fake_audio(tmpdir, "hello.wav")
+            app = MockApp(files=[audio])
+            _, dia_mocks = self._run(opts, app, dia_overrides={
+                "load_diarization_pipeline": MagicMock(
+                    side_effect=RuntimeError("no weights"))})
+            txt = (Path(tmpdir) / "hello.txt").read_text(encoding="utf-8")
+            self.assertEqual(txt, "transcribed text\n")  # no labels
+            warns = [p for k, p in app.events if k == "log"
+                     and "without speaker labels" in p["message"]]
+            self.assertTrue(warns)
+            self.assertEqual(warns[0].get("level"), "warning")
+            done = [p for k, p in app.events if k == "done"][0]
+            self.assertEqual(done["done_count"], 1)
+            # The per-file diarize path must never have run.
+            dia_mocks["load_waveform"].assert_not_called()
+
+    def test_per_file_diarize_failure_keeps_transcript(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            opts = _make_opts(tmpdir, formats=["txt"])
+            opts.diarize = True
+            audio = _make_fake_audio(tmpdir, "hello.wav")
+            app = MockApp(files=[audio])
+            self._run(opts, app, dia_overrides={
+                "load_waveform": MagicMock(side_effect=MemoryError("oom"))})
+            txt = (Path(tmpdir) / "hello.txt").read_text(encoding="utf-8")
+            self.assertEqual(txt, "transcribed text\n")
+            kinds = [e[0] for e in app.events]
+            self.assertIn("file_finished", kinds)
+            self.assertNotIn("preview_replace", kinds)  # failed → no refresh
+            warns = [p for k, p in app.events if k == "log"
+                     and "keeping the transcript" in p["message"]]
+            self.assertTrue(warns)
+            self.assertEqual(warns[0].get("level"), "warning")
+            done = [p for k, p in app.events if k == "done"][0]
+            self.assertEqual(done["done_count"], 1)
+            self.assertEqual(done["failed_count"], 0)
+
+    def test_cancel_mid_diarize(self):
+        from hebrewscribe.diarize import DiarizationCancelled
+        with tempfile.TemporaryDirectory() as tmpdir:
+            opts = _make_opts(tmpdir, formats=["txt"])
+            opts.diarize = True
+            audio = _make_fake_audio(tmpdir, "hello.wav")
+            app = MockApp(files=[audio])
+            self._run(opts, app, dia_overrides={
+                "diarize_waveform": MagicMock(
+                    side_effect=DiarizationCancelled())})
+            done = [p for k, p in app.events if k == "done"][0]
+            self.assertTrue(done["cancelled"])
+            failed = [p for k, p in app.events if k == "file_failed"]
+            self.assertEqual(failed[0]["status"], "Cancelled")
+
+    def test_retry_path_diarizes_too(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            opts = _make_opts(tmpdir, formats=["txt"])
+            opts.diarize = True
+            audio = _make_fake_audio(tmpdir, "hello.wav")
+            app = MockApp(files=[audio])
+            corrupt = RuntimeError(
+                "[json.exception.type_error.305] cannot use operator[]")
+            transcribe_mock = MagicMock(
+                side_effect=[corrupt, _FAKE_RESULT.copy()])
+            with patch(f"{WORKER_MODULE}._purge_and_reload",
+                       return_value=(MagicMock(), "cpu")):
+                _, dia_mocks = self._run(
+                    opts, app,
+                    worker_overrides={"transcribe_faster": transcribe_mock})
+            txt = (Path(tmpdir) / "hello.txt").read_text(encoding="utf-8")
+            self.assertEqual(txt, "דובר 1:\ntranscribed text\n")
+            # Diarization ran exactly once — on the successful retry.
+            self.assertEqual(dia_mocks["load_waveform"].call_count, 1)
+            done = [p for k, p in app.events if k == "done"][0]
+            self.assertEqual(done["done_count"], 1)
+
+    def test_long_file_ram_warning(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            opts = _make_opts(tmpdir, formats=["txt"])
+            opts.diarize = True
+            audio = _make_fake_audio(tmpdir, "long.wav")
+            app = MockApp(files=[audio])
+            self._run(opts, app, worker_overrides={
+                "probe_duration_seconds": MagicMock(return_value=3 * 3600.0)})
+            warns = [p for k, p in app.events if k == "log"
+                     and "over 2 hours" in p["message"]]
+            self.assertTrue(warns)
+            self.assertEqual(warns[0].get("level"), "warning")
+            done = [p for k, p in app.events if k == "done"][0]
+            self.assertEqual(done["done_count"], 1)
+
+    def test_diarize_progress_events_omit_audio_seconds(self):
+        """Diarize-phase current_progress must not carry processed/total
+        seconds (would double-count batch audio in the GUI's ETA)."""
+        from hebrewscribe.diarize import diarize_waveform
+
+        class _FakePipeline:
+            def __call__(self, waveform, num_speakers=None, hook=None):
+                hook("segmentation", None, total=10, completed=10)
+                return types.SimpleNamespace(
+                    exclusive_speaker_diarization="ann")
+
+        app = MockApp()
+        out = diarize_waveform(_FakePipeline(), {"waveform": None},
+                               app, Path("/a/x.wav"), num_speakers=0,
+                               total_seconds=100.0)
+        self.assertEqual(out, "ann")
+        prog = [p for k, p in app.events if k == "current_progress"]
+        self.assertTrue(prog)
+        self.assertNotIn("processed_seconds", prog[0])
+        self.assertNotIn("total_seconds", prog[0])
+        self.assertEqual(prog[0]["phase"], "Identifying speakers…")
+        self.assertEqual(prog[0]["row_status"], "Running")
+
+    def test_diarize_num_speakers_zero_maps_to_none(self):
+        from hebrewscribe.diarize import diarize_waveform
+        seen = {}
+
+        class _FakePipeline:
+            def __call__(self, waveform, num_speakers=None, hook=None):
+                seen["num_speakers"] = num_speakers
+                return "ann"
+
+        app = MockApp()
+        diarize_waveform(_FakePipeline(), {"waveform": None}, app,
+                         Path("/a/x.wav"), num_speakers=0)
+        self.assertIsNone(seen["num_speakers"])
+        diarize_waveform(_FakePipeline(), {"waveform": None}, app,
+                         Path("/a/x.wav"), num_speakers=3)
+        self.assertEqual(seen["num_speakers"], 3)
+
+
+class TestSelfTestDiarization(unittest.TestCase):
+    """The optional speaker-identification self-test step."""
+
+    def _run_selftest(self, dia_patches):
+        from contextlib import ExitStack
+
+        from hebrewscribe.worker import run_selftest
+        with ExitStack() as stack:
+            stack.enter_context(patch(f"{WORKER_MODULE}.load_model",
+                                      return_value=(MagicMock(), "cpu")))
+            stack.enter_context(patch(f"{WORKER_MODULE}.transcribe_faster",
+                                      return_value=_FAKE_RESULT.copy()))
+            stack.enter_context(patch(f"{WORKER_MODULE}.ffmpeg_available",
+                                      return_value=True))
+            for p in dia_patches:
+                stack.enter_context(p)
+            return run_selftest(MockApp(), "faster-whisper", "cpu", "int8")
+
+    def test_clean_skip_when_not_installed(self):
+        result = self._run_selftest([
+            patch("hebrewscribe.diarize.is_diarization_available",
+                  return_value=False)])
+        self.assertTrue(result.passed)
+        self.assertTrue(any("optional" in c for c in result.checks))
+
+    def test_warn_when_weights_missing(self):
+        result = self._run_selftest([
+            patch("hebrewscribe.diarize.is_diarization_available",
+                  return_value=True),
+            patch("hebrewscribe.diarize.resolve_weights_dir",
+                  return_value=None)])
+        self.assertTrue(result.passed)
+        self.assertTrue(any("download on first use" in c
+                            for c in result.checks))
+
+    def test_ok_when_weights_present_and_pipeline_loads(self):
+        result = self._run_selftest([
+            patch("hebrewscribe.diarize.is_diarization_available",
+                  return_value=True),
+            patch("hebrewscribe.diarize.resolve_weights_dir",
+                  return_value=Path("/fake/weights")),
+            patch("hebrewscribe.diarize.load_diarization_pipeline",
+                  return_value=MagicMock())])
+        self.assertTrue(result.passed)
+        self.assertTrue(any("pipeline loads" in c for c in result.checks))
+
+    def test_fail_when_pipeline_broken(self):
+        result = self._run_selftest([
+            patch("hebrewscribe.diarize.is_diarization_available",
+                  return_value=True),
+            patch("hebrewscribe.diarize.resolve_weights_dir",
+                  return_value=Path("/fake/weights")),
+            patch("hebrewscribe.diarize.load_diarization_pipeline",
+                  side_effect=RuntimeError("broken install"))])
+        self.assertFalse(result.passed)
+        self.assertTrue(any("Speaker identification broken" in c
+                            for c in result.checks))
+
+
+class _PausedHost:
+    def __init__(self):
+        self.pause_event = threading.Event()
+        self.pause_event.set()  # running (not paused)
+        self.cancel_requested = True
+        self.stop_requested = False
+        self.events = []
+
+    def post_event(self, kind, **payload):
+        self.events.append(kind)
+
+
+class TestWaitIfPausedCancel(unittest.TestCase):
+    def test_pending_cancel_wins_over_resume(self):
+        """A cancel requested while paused must take effect on resume,
+        not after the next file has already started."""
+        from hebrewscribe.worker import wait_if_paused, CancelledByUser
+        host = _PausedHost()
+        with self.assertRaises(CancelledByUser):
+            wait_if_paused(host)
+        self.assertNotIn("resumed", host.events)
 
 
 if __name__ == "__main__":

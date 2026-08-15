@@ -22,6 +22,12 @@ if "tkinter" not in sys.modules:
     _tk_stub.BooleanVar = lambda *a, **kw: None
     _tk_stub.filedialog = types.ModuleType("tkinter.filedialog")
     _tk_stub.messagebox = types.ModuleType("tkinter.messagebox")
+    # No-op dialogs so app methods exercised headless (e.g. _append_files'
+    # duplicate notice, clear_files' confirm) don't need a display.
+    _tk_stub.messagebox.showinfo = lambda *a, **kw: None
+    _tk_stub.messagebox.showwarning = lambda *a, **kw: None
+    _tk_stub.messagebox.showerror = lambda *a, **kw: None
+    _tk_stub.messagebox.askyesno = lambda *a, **kw: True
     _tk_stub.ttk = types.ModuleType("tkinter.ttk")
     for _name in ("Frame", "LabelFrame", "Panedwindow", "Label", "Button", "Entry",
                    "Combobox", "Checkbutton", "Treeview", "Scrollbar", "Progressbar",
