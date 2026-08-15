@@ -1,0 +1,16 @@
+# Line-ending policy: LF in the repository and the working tree.
+#
+# The repo shipped without a .gitattributes, so editing on Windows once let the
+# entire tree drift to CRLF while the committed history stayed LF. This file
+# pins LF so that never happens again (and matches .editorconfig end_of_line=lf).
+
+* text=auto eol=lf
+
+# Windows batch files must use CRLF to be safe across cmd.exe versions.
+*.bat text eol=crlf
+
+# Binary assets — never normalize line endings.
+*.png  binary
+*.ico  binary
+*.icns binary
+*.wav  binary
