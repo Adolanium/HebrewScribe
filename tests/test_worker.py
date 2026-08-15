@@ -16,6 +16,7 @@ from hebrewscribe.worker import (
     _completion_progress, _auto_batch_size, _get_batched_pipeline,
     _batched_pipeline_cache, preconvert_audio,
     _is_ct2_corruption_error, _find_hf_cache_dir,
+    _model_bin_status, _download_with_progress,
 )
 
 
@@ -679,6 +680,109 @@ class TestIsCt2CorruptionError(unittest.TestCase):
             "models--ivrit-ai--whisper-large-v3-ct2\\snapshots\\abc123'"
         )
         self.assertTrue(_is_ct2_corruption_error(exc))
+
+
+class TestModelBinStatus(unittest.TestCase):
+    """Tests for _model_bin_status validation helper."""
+
+    def test_ok_for_complete_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            (d / "model.bin").write_bytes(b"x" * (11 * 1024 * 1024))
+            (d / "config.json").write_text("{}", encoding="utf-8")
+            (d / "tokenizer.json").write_text("{}", encoding="utf-8")
+            ok, detail = _model_bin_status(d)
+            self.assertTrue(ok, detail)
+            self.assertIn("ok", detail)
+
+    def test_fails_when_model_bin_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            (d / "config.json").write_text("{}", encoding="utf-8")
+            (d / "tokenizer.json").write_text("{}", encoding="utf-8")
+            ok, detail = _model_bin_status(d)
+            self.assertFalse(ok)
+            self.assertIn("missing", detail)
+
+    def test_fails_when_model_bin_too_small(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            (d / "model.bin").write_bytes(b"tiny")
+            (d / "config.json").write_text("{}", encoding="utf-8")
+            (d / "tokenizer.json").write_text("{}", encoding="utf-8")
+            ok, detail = _model_bin_status(d)
+            self.assertFalse(ok)
+            self.assertIn("too small", detail)
+
+
+class TestDownloadCacheCheck(unittest.TestCase):
+    """An unfinished cache must resume, not raise and not count as done."""
+
+    def test_incomplete_cache_resumes_download(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            incomplete = Path(tmpdir) / "incomplete"
+            incomplete.mkdir()
+            (incomplete / "config.json").write_text("{}", encoding="utf-8")
+            (incomplete / "tokenizer.json").write_text("{}", encoding="utf-8")
+
+            complete = Path(tmpdir) / "complete"
+            complete.mkdir()
+            (complete / "model.bin").write_bytes(b"x" * (11 * 1024 * 1024))
+            (complete / "config.json").write_text("{}", encoding="utf-8")
+            (complete / "tokenizer.json").write_text("{}", encoding="utf-8")
+
+            calls = []
+
+            def fake_snapshot(repo_id, local_files_only=False, **kwargs):
+                calls.append(bool(local_files_only))
+                if local_files_only:
+                    return str(incomplete)
+                return str(complete)
+
+            host = MagicMock()
+            fake_hub = types.ModuleType("huggingface_hub")
+            fake_hub.snapshot_download = fake_snapshot
+            with patch.dict("sys.modules", {"huggingface_hub": fake_hub}):
+                result = _download_with_progress(host, "org/model")
+
+            self.assertEqual(result, str(complete))
+            self.assertEqual(calls, [True, False])
+            messages = [
+                c.kwargs.get("message", "")
+                for c in host.post_event.call_args_list
+                if c.args and c.args[0] == "log"
+            ]
+            self.assertTrue(any("incomplete" in m.lower() for m in messages))
+            self.assertFalse(any("already cached" in m.lower() for m in messages))
+
+    def test_complete_cache_is_used(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            complete = Path(tmpdir) / "complete"
+            complete.mkdir()
+            (complete / "model.bin").write_bytes(b"x" * (11 * 1024 * 1024))
+            (complete / "config.json").write_text("{}", encoding="utf-8")
+            (complete / "tokenizer.json").write_text("{}", encoding="utf-8")
+
+            calls = []
+
+            def fake_snapshot(repo_id, local_files_only=False, **kwargs):
+                calls.append(bool(local_files_only))
+                return str(complete)
+
+            host = MagicMock()
+            fake_hub = types.ModuleType("huggingface_hub")
+            fake_hub.snapshot_download = fake_snapshot
+            with patch.dict("sys.modules", {"huggingface_hub": fake_hub}):
+                result = _download_with_progress(host, "org/model")
+
+            self.assertEqual(result, str(complete))
+            self.assertEqual(calls, [True])
+            messages = [
+                c.kwargs.get("message", "")
+                for c in host.post_event.call_args_list
+                if c.args and c.args[0] == "log"
+            ]
+            self.assertTrue(any("already cached" in m.lower() for m in messages))
 
 
 class TestFindHfCacheDir(unittest.TestCase):

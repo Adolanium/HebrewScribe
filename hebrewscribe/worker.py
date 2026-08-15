@@ -306,6 +306,51 @@ def _is_ct2_corruption_error(exc: Exception) -> bool:
     )
 
 
+# Minimum size for a usable CT2 Whisper weight file (tiny is ~75 MB).
+_MIN_MODEL_BIN_BYTES = 10 * 1024 * 1024
+
+# Files required in a CTranslate2 Whisper model directory.
+_CT2_REQUIRED_FILES = (
+    "model.bin",
+    "config.json",
+    "tokenizer.json",
+)
+
+
+def _model_bin_status(model_dir: Path) -> tuple[bool, str]:
+    """Check whether *model_dir* looks like a readable CT2 Whisper model.
+
+    Returns ``(ok, detail)``.  ``ok`` is True only when required files exist,
+    ``model.bin`` is readable, and its size is plausible.
+    """
+    if not model_dir.is_dir():
+        return False, f"not a directory: {model_dir}"
+
+    missing = [name for name in _CT2_REQUIRED_FILES
+               if not (model_dir / name).exists()]
+    if missing:
+        return False, f"missing files: {', '.join(missing)}"
+
+    model_bin = model_dir / "model.bin"
+    try:
+        size = model_bin.stat().st_size
+    except OSError as exc:
+        return False, f"cannot stat model.bin: {exc}"
+
+    if size < _MIN_MODEL_BIN_BYTES:
+        return False, f"model.bin too small ({size} bytes) — download incomplete?"
+
+    try:
+        with open(model_bin, "rb") as fh:
+            header = fh.read(16)
+        if not header:
+            return False, "model.bin is empty / unreadable"
+    except OSError as exc:
+        return False, f"cannot read model.bin: {exc}"
+
+    return True, f"model.bin ok ({size} bytes)"
+
+
 def _find_hf_cache_dir(model_spec: str) -> Optional[Path]:
     """Locate the HuggingFace cache directory for *model_spec*.
 
@@ -453,19 +498,37 @@ def _download_with_progress(host: WorkerHost, repo_id: str) -> str:
     """Download a HuggingFace model with progress events posted to the GUI.
 
     Returns the local path to use with WhisperModel().
-    If the model is already cached, returns immediately with no download events.
+    If the model is already cached and ``model.bin`` looks usable, returns
+    immediately with no download events.
+
+    A folder created before ``model.bin`` finished is not treated as a cache
+    hit. The download is resumed instead of raising, so the existing
+    load-failure repair can still run if the files stay unusable.
     """
     import huggingface_hub
+
+    _allow = [
+        "config.json", "preprocessor_config.json",
+        "model.bin", "tokenizer.json", "vocabulary.*",
+    ]
 
     # Check if already cached (fast path — no download events emitted)
     try:
         local = huggingface_hub.snapshot_download(
             repo_id, local_files_only=True,
-            allow_patterns=["config.json", "preprocessor_config.json",
-                            "model.bin", "tokenizer.json", "vocabulary.*"],
+            allow_patterns=_allow,
         )
-        host.post_event("log", message=f"Model already cached: {repo_id}")
-        return local
+        ok, detail = _model_bin_status(Path(local))
+        if ok:
+            host.post_event("log", message=f"Model already cached: {repo_id}")
+            return local
+        host.post_event(
+            "log",
+            message=(
+                f"Cached model is incomplete ({detail}). "
+                f"Resuming download..."
+            ),
+        )
     except Exception:
         pass  # Not cached — proceed with download
 
@@ -554,8 +617,7 @@ def _download_with_progress(host: WorkerHost, repo_id: str) -> str:
 
     local = huggingface_hub.snapshot_download(
         repo_id,
-        allow_patterns=["config.json", "preprocessor_config.json",
-                        "model.bin", "tokenizer.json", "vocabulary.*"],
+        allow_patterns=_allow,
         tqdm_class=_ProgressTqdm,
     )
     host.post_event("download_done", repo_id=repo_id)
