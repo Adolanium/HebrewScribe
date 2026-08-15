@@ -1,5 +1,10 @@
 # HebrewScribe
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-lightgrey.svg)](#quick-start)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
+[![Microsoft Store](https://img.shields.io/badge/Microsoft%20Store-HebrewScribe-0078D4)](https://apps.microsoft.com/detail/9PBS32VWZPBB)
+
 A free, offline desktop application for batch transcription of Hebrew audio using local Whisper models.
 
 HebrewScribe turns Hebrew audio files into text on your own computer, with no cloud services, no accounts, and no data leaving your machine. Queue a handful of recordings or an entire folder, and let it run. Powered by [faster-whisper](https://github.com/SYSTRAN/faster-whisper) and Whisper models fine-tuned for Hebrew by [ivrit-ai](https://huggingface.co/ivrit-ai).
@@ -17,21 +22,43 @@ The process is entirely local:
 - Voice Activity Detection filters silence for faster processing
 - GPU acceleration when available (CUDA on Windows)
 - Sleep prevention keeps your machine awake during long batches
+- Live recording (experimental): dictate into the microphone and watch the transcript appear
 
 ![HebrewScribe main window](screenshot.png)
 
 ## Quick Start
 
-Download the Windows installer from [yevgeniyglider.com/hebrewscribe](https://yevgeniyglider.com/hebrewscribe/) and run it.
+**Windows** — install from the Microsoft Store (recommended: always the current version, updates automatically, no security prompts):
 
-On macOS, install/build from source.
+<a href="https://apps.microsoft.com/detail/9PBS32VWZPBB"><img src="https://get.microsoft.com/images/en-us%20dark.svg" width="200" alt="Get HebrewScribe from the Microsoft Store"/></a>
+
+**macOS** — install from source (below).
+
+Other options, including a direct Windows installer for machines where the Store is unavailable, are listed at [yevgeniyglider.com/hebrewscribe](https://yevgeniyglider.com/hebrewscribe/).
 
 ## Installation from Source
 
-Requires Python 3.9+ and [FFmpeg](https://ffmpeg.org).
+Requires Python 3.10+ and [FFmpeg](https://ffmpeg.org).
 
 ```bash
 pip install -e ".[faster]"
+```
+
+For speaker diarization ("Identify speakers"), add the `diarization` extra —
+it pulls PyTorch, so prefer the CPU wheel index unless you have a CUDA GPU:
+
+```bash
+pip install -e ".[faster,diarization]" --extra-index-url https://download.pytorch.org/whl/cpu
+```
+
+The speaker model (~33 MB) downloads automatically on first use and runs
+fully offline afterwards. On macOS this requires Apple Silicon.
+
+For experimental live recording (dictation from the microphone), add the
+`recording` extra:
+
+```bash
+pip install -e ".[faster,recording]"
 ```
 
 Run with `python -m hebrewscribe`, or double-click `HebrewScribe.pyw` (Windows) / `HebrewScribe.command` (macOS).
@@ -42,10 +69,11 @@ HebrewScribe is a Python desktop application using tkinter for the GUI:
 
 - **GUI:** tkinter with a custom flat theme, DPI-aware on Windows
 - **Transcription:** [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2-based)
+- **Speaker diarization (optional):** [pyannote.audio](https://github.com/pyannote/pyannote-audio) community-1 pipeline, fully offline with self-hosted weights
 - **Audio:** FFmpeg for format conversion
 - **Models:** Curated selection from [ivrit-ai](https://huggingface.co/ivrit-ai) (Hebrew) and [Systran](https://huggingface.co/Systran) (multilingual), downloaded from Hugging Face Hub
 
-The codebase is a single Python package (`hebrewscribe/`) with 8 focused modules: app, worker, models, outputs, power, theme, utils, and widgets. 252 tests cover the core logic.
+The codebase is a single Python package (`hebrewscribe/`) with 10 focused modules: app, worker, recorder, diarize, models, outputs, power, theme, utils, and widgets. 360+ tests cover the core logic.
 
 ## Project Map
 
@@ -66,8 +94,8 @@ HebrewScribe/
   scripts/render_icons.py          # SVG-to-PNG build script
   icon.ico / icon.icns             # App icons
   screenshot.png                   # README screenshot
-  hebrewscribe/                    # Source package (8 modules + icons)
-  tests/                           # 252 tests
+  hebrewscribe/                    # Source package (10 modules + icons)
+  tests/                           # 360+ tests
   assets/                          # SVG source icons
 ```
 

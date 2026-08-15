@@ -64,6 +64,7 @@ CLAUDE.md
 GIT-CHEATSHEET.md
 RELEASING.md
 BACKLOG.md
+MAP.md
 
 # ── Local-only scripts ───────────────────────────────────
 scripts/pre-publish-check.sh
