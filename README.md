@@ -11,7 +11,7 @@ HebrewScribe turns Hebrew audio files into text on your own computer, with no cl
 
 ## Why HebrewScribe?
 
-- **Hebrew-first:** Ships with ivrit-ai/whisper-large-v3, a Whisper model fine-tuned specifically for Hebrew. Also supports English, Russian, French, and other languages
+- **Hebrew-first:** For Hebrew it selects [ivrit-ai large-v3](https://huggingface.co/ivrit-ai/whisper-large-v3-ct2) — ivrit-ai's Hebrew fine-tune of Whisper large-v3 — and downloads it on first use. English and other languages are also selectable, each with its own model
 - **Private and open source:** All processing happens locally. No cloud, no telemetry, no accounts. The only network call is downloading a model the first time. [Source code on GitHub](https://github.com/yevgeniyglider/HebrewScribe) for full transparency
 - **Batch-oriented:** Queue files and folders, reorder the queue mid-run, get per-file and batch ETAs with real-time progress
 - **Free:** No subscriptions, no usage limits, no expiry
